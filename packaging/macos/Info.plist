@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bundle metadata for agnosis.app.
+
+  CFBundleIdentifier MUST stay "com.agnosis.daemon": it is the same string as
+  `platform::APP_BUNDLE_ID`, and the macOS privacy grants (Input Monitoring)
+  are keyed on the bundle id, so a change here silently drops the user's
+  grant on every upgrade.
+
+  The release workflow rewrites CFBundleShortVersionString and
+  CFBundleVersion from the crate version, so the checked-in values only have
+  to match Cargo.toml (0.1.0) - keep them in step when the version moves.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AGnosis</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.agnosis.daemon</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AGnosis</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<!-- Menu-bar app: no Dock icon, no menu bar of its own. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>AGnosis is released under the Open Source License with Ethical Restrictions (LICENSE.txt).</string>
+</dict>
+</plist>

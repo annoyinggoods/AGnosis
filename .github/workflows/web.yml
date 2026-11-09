@@ -1,0 +1,266 @@
+name: Web
+
+# The web front end is built, smoke tested and published in its OWN
+# workflow, on purpose: a broken web build must NEVER block the native
+# release (the roadmap's explicit decision). Nothing in release.yml
+# waits for this workflow and nothing here waits for release.yml, so the
+# two fail independently — a red "Web" run leaves the native release
+# untouched.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  web:
+    name: Build, smoke test and publish the web front end
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The CLI must match the wasm-bindgen CRATE exactly: the crate is
+      # pinned `=0.2.129`, and a CLI built for another version refuses
+      # the module ("schema version mismatch"). The build script checks
+      # the version too and says which one it wanted.
+      - name: Install the wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli,version:0.2.129
+
+      # `bash` and not `./build-web.sh`: the repository's `core.fileMode`
+      # is off, so git does not carry the executable bit. The script
+      # works either way.
+      - name: Build the web bundle
+        shell: bash
+        run: bash crates/agnosis-web/build-web.sh crates/agnosis-web/dist
+
+      # The smoke test: a wasm build that compiles but renders a black
+      # rectangle is the one failure the CI has to catch, so every back
+      # end the page offers is rendered headless and looked at.
+      - name: Smoke test (headless Chrome, one leg per back end)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist="crates/agnosis-web/dist"
+          # The scratch folders live under `target/`, which is ignored:
+          # a smoke test must not leave files in the working tree.
+          site="target/web-smoke-site"
+          out="target/web-smoke"
+          port=8765
+          width=1280
+          height=720
+          # The canvas' own rectangle: the page draws its toolbar above
+          # the canvas, so the WHOLE screenshot is never black — and a
+          # dead canvas would slip through a whole-image check. The
+          # region below the toolbar is the parade.
+          region="0,$((height / 10)),${width},$((height - height / 10))"
+
+          # The ducks' own colour (`agnosis_core::scene::DUCK_COLOR`) and
+          # how many of its pixels the canvas has to carry.
+          #
+          # WHY the ink check is not enough: a canvas whose grid cell is
+          # one pixel tall drops the duck art entirely — the balloons
+          # and the grass still carry ink, so the ink share stays above
+          # the bar while the parade's headline is gone. The colour
+          # check asks for the ducks themselves.
+          #
+          # WHY 500: a good 1280x720 render paints ~5600 duck pixels
+          # (the cell is 2 x 3 there), so 500 is a wide margin — wide
+          # enough that a duck that marched off the screen cannot fail
+          # the build, narrow enough that a missing art fails it. The
+          # rope is the only other warm colour in the parade and the
+          # colour check leaves it out of the count.
+          duck_colour="255,220,80"
+          duck_pixels=500
+
+          # The browser: the runner's Chrome, or whatever CHROME_BIN
+          # points at.
+          chrome="${CHROME_BIN:-}"
+          if [ -z "${chrome}" ]; then
+            for candidate in google-chrome google-chrome-stable chromium chromium-browser chrome; do
+              if command -v "${candidate}" >/dev/null 2>&1; then
+                chrome="${candidate}"
+                break
+              fi
+            done
+          fi
+          if [ -z "${chrome}" ]; then
+            echo "no Chrome binary found: set CHROME_BIN" >&2
+            exit 1
+          fi
+
+          # The served copy is a COPY of the bundle: the smoke-test
+          # pages are written next to it, and the published bundle
+          # stays exactly what the build produced.
+          rm -rf "${site}" "${out}"
+          mkdir -p "${out}"
+          cp -R "${dist}" "${site}"
+          ls -l "${site}"
+
+          # The smoke-test pages. The page has no `?backend=` URL
+          # parameter (its owner owns index.html), so the forced legs
+          # are copies that drive the page's OWN back-end selector.
+          # The "auto" copy only waits for the page.
+          for backend in auto canvas2d webgl2 webgpu; do
+            python3 crates/agnosis-web/tools/force-backend.py \
+              "${site}/index.html" "${backend}" "${site}/smoke-${backend}.html"
+          done
+
+          # The static server. It is `tools/serve.py` and not
+          # `http-server` for two reasons: it sends `application/wasm`
+          # for the module (Python's own http.server does not, and the
+          # page's streaming instantiation refuses that), and it has a
+          # `/wait` route the smoke pages use to hold the browser's
+          # virtual clock still while the parade boots.
+          python3 crates/agnosis-web/tools/serve.py "${site}" "${port}" > "${out}/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "${server_pid}" >/dev/null 2>&1 || true' EXIT
+
+          for attempt in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${port}/" -o /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -fsS "http://127.0.0.1:${port}/" -o /dev/null; then
+            echo "the static server never answered on ${port}" >&2
+            cat "${out}/server.log" >&2
+            exit 1
+          fi
+
+          # One leg: render the page in one back end and assert on it.
+          #
+          # The retry is not slack: the headless render races the
+          # browser's compositor, so a leg whose canvas came out black
+          # is tried again. A page that really renders a black
+          # rectangle fails every attempt.
+          run_leg() {
+            leg="$1"
+            page="smoke-${leg}.html"
+            flags="--disable-gpu"
+            capturable="yes"
+
+            case "${leg}" in
+              auto)
+                page="smoke-auto.html" ;;
+              webgpu)
+                # The runner has no GPU, so WebGPU needs the software
+                # adapter -- and it needs the GPU process: with
+                # --disable-gpu the adapter request never completes.
+                flags="--enable-unsafe-webgpu --use-webgpu-adapter=swiftshader"
+                # A WebGPU canvas is not composited into the headless
+                # screenshot (a minimal page that clears a WebGPU
+                # canvas red comes out black too), so this leg asserts
+                # the page and not the pixels.
+                capturable="no" ;;
+              webgpu-fallback)
+                # The same forced back end on a runner with no WebGPU
+                # adapter: the page has to fall back and keep the
+                # parade on the screen.
+                page="smoke-webgpu.html" ;;
+            esac
+
+            rendered=0
+            for attempt in 1 2 3; do
+              echo "==> ${leg} (attempt ${attempt})"
+              # The screenshot AND the DOM in one run: Chrome dumps the
+              # DOM when the page has settled, so the diagnostic box is
+              # read after the parade has run, not before it started.
+              "${chrome}" --headless=new --no-sandbox ${flags} --hide-scrollbars \
+                --window-size=${width},${height} --virtual-time-budget=30000 \
+                --screenshot="${PWD}/${out}/${leg}.png" --dump-dom \
+                "http://127.0.0.1:${port}/${page}" \
+                > "${out}/${leg}.dom" 2> "${out}/${leg}.console" || true
+
+              # The console, for the log. A console line is not a failure
+              # on its own (Chrome logs plenty of noise); the page's own
+              # diagnostic box is the assertion.
+              grep -E "INFO:CONSOLE|ERROR" "${out}/${leg}.console" || true
+
+              if [ "${capturable}" = "no" ]; then
+                rendered=1
+                break
+              fi
+              # The canvas has to be alive AND carry the ducks: the ink
+              # share alone is satisfied by a balloon.
+              if ! python3 crates/agnosis-web/tools/pngcheck.py \
+                --region "${region}" --min-ink 0.2 "${out}/${leg}.png"; then
+                echo "    the canvas was black: retrying" >&2
+                continue
+              fi
+              if ! python3 crates/agnosis-web/tools/pngcheck.py \
+                --region "${region}" --min-colour "${duck_colour}" "${duck_pixels}" \
+                "${out}/${leg}.png"; then
+                echo "    the ducks are missing: retrying" >&2
+                continue
+              fi
+              rendered=1
+              break
+            done
+
+            # The whole screenshot: it must not be a black rectangle
+            # either.
+            python3 crates/agnosis-web/tools/pngcheck.py "${out}/${leg}.png"
+
+            # The page's own diagnostics: the diagnostic box has to be
+            # empty and the status line has to name a back end.
+            python3 crates/agnosis-web/tools/check-page.py "${out}/${leg}.dom"
+
+            if [ "${rendered}" -ne 1 ]; then
+              echo "the ${leg} leg rendered a black canvas (or no ducks) in every attempt" >&2
+              exit 1
+            fi
+          }
+
+          # One leg per back end the page offers: the default ("auto"),
+          # the three forced ones, and the fallback (the forced WebGPU
+          # on a runner without a WebGPU adapter).
+          for leg in auto canvas2d webgl2 webgpu webgpu-fallback; do
+            run_leg "${leg}"
+          done
+
+      # The artefacts are CI artefacts, not repository files: the bundle
+      # is built, not committed.
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: agnosis-web
+          path: crates/agnosis-web/dist
+
+      # The site is published on every merge to main — and only there:
+      # a pull request never deploys.
+      - name: Configure GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v5
+
+      - name: Upload the Pages artefact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: crates/agnosis-web/dist
+
+      - name: Publish to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/deploy-pages@v4

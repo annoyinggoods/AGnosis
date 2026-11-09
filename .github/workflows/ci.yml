@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev libasound2-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # The browser target is checked by the **blocking** workflow:
+          # the core exists to be compiled for the browser, and the web
+          # front end's back end is `#[cfg(target_arch = "wasm32")]`, so
+          # no host build ever type-checks it (audit 2026-10-21 §G15).
+          targets: wasm32-unknown-unknown
+
+      # `--workspace` is not optional: the workspace has three members
+      # (the `agnosis` binary, the pure `agnosis-core` library and the
+      # `agnosis-web` WASM front end) and a plain `cargo test` at the root
+      # selects the *root package only* — the core's 645 tests would
+      # silently never run.
+      - name: Cargo Check
+        run: cargo check --workspace --all-targets
+
+      # The browser build is checked **here**, not only in `web.yml`.
+      # `web.yml` is designed not to gate anything (a broken web build
+      # must never block the native release), so before this step a PR
+      # that broke the wasm build showed a green "CI" and a red "Web" —
+      # and the 511-line WebGPU/WebGL2 back end, which is behind
+      # `#[cfg(target_arch = "wasm32")]`, was never type-checked by the
+      # workflow that actually blocks a merge (audit 2026-10-21 §G15).
+      - name: Cargo Check (wasm32)
+        run: cargo check -p agnosis-core -p agnosis-web --target wasm32-unknown-unknown
+
+      - name: Cargo Test
+        run: cargo test --workspace --all-targets -- --nocapture
+
+      # `-p agnosis` names the package: in a workspace `cargo run` still
+      # picks the root package, but the explicit selector keeps the
+      # command honest if the default ever changes.
+      - name: Headless Selftest
+        run: cargo run -p agnosis -- selftest --frames 2 --out ./ci_selftest_out
+
+      - name: Windows Smoke Test and Timing Assertion
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # `target/debug/agnosis.exe` is the ROOT package's binary: in a
+          # workspace the shared target directory still holds it there
+          # (the members share one `target/`), and the selftest step
+          # above already built it. `cargo build -p agnosis` says it out
+          # loud, so the step does not depend on a previous step's side
+          # effect.
+          cargo build -p agnosis
+          $env:DUCKS_TRACE = "1"
+          $proc = Start-Process -FilePath "target/debug/agnosis.exe" -ArgumentList "popup --origin 0,0 --size 800,600 --scale 1.0" -PassThru -RedirectStandardOutput "smoke_trace.txt"
+          Start-Sleep -Milliseconds 600
+          # `agnosis stop` asks the **daemon** to stop, but this step runs
+          # the *popup* — no daemon is running, so the command reports
+          # "no daemon running" and exits 1. The `pwsh` runner ends the
+          # step with `$LASTEXITCODE`, so that **expected** failure made
+          # the job fail even though the smoke test itself had succeeded
+          # (audit 2026-10-21 §G16). The exit code is neutralised here;
+          # the popup process is stopped by the `Stop-Process` branch
+          # below, which is the branch that actually owns it.
+          cargo run -p agnosis -- stop
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "agnosis stop exited $LASTEXITCODE (no daemon is running - expected)"
+          }
+          $global:LASTEXITCODE = 0
+          Start-Sleep -Milliseconds 200
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+          Get-Content "smoke_trace.txt"
+          $shownLine = Get-Content "smoke_trace.txt" | Where-Object { $_ -match "DUCKS_TRACE\s+([\d\.]+)\s+popup\.shown-black" } | Select-Object -First 1
+          if (-not $shownLine) {
+            Write-Error "smoke test failed: popup.shown-black trace line not found"
+            exit 1
+          }
+          if ($shownLine -match "DUCKS_TRACE\s+([\d\.]+)\s+popup\.shown-black") {
+            $ms = [double]$Matches[1]
+            Write-Host "Window shown in $ms ms (budget: 200ms)"
+            if ($ms -gt 200.0) {
+              Write-Error "Timing assertion failed: window shown in $ms ms (exceeds 200ms limit)"
+              exit 1
+            }
+          }

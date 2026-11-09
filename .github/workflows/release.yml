@@ -1,0 +1,814 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve the package version
+        id: ver
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The version is read from the `[package]` table ONLY: the
+          # workspace table sits above it in Cargo.toml, and a
+          # `[workspace.package]` table would carry a `version` key of
+          # its own — a naive "the first `version =` line" grep would
+          # pick the wrong one.
+          if [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' | head -n 1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "could not resolve the package version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "building agnosis ${version}"
+
+      # `-p agnosis`: the release ships the ROOT package's binary. The
+      # workspace's default member is the root package too, so this is
+      # the same build today — but naming the package keeps the release
+      # from ever picking up a workspace member by accident.
+      - name: Build the release binary
+        run: cargo build --release --locked -p ducks
+
+      # The release binary is a GUI-subsystem binary: the CLI verbs print
+      # nothing by design, so the smoke test asserts that the selftest PNG
+      # frames appeared on disk instead of looking at stdout.
+      - name: Smoke Test (the selftest writes the PNG frames)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf selftest_out
+          set +e
+          ./target/release/agnosis.exe selftest --frames 2 --out ./selftest_out > selftest.log 2>&1
+          code=$?
+          set -e
+          frames=0
+          if [ -d selftest_out ]; then
+            frames="$(find selftest_out -maxdepth 1 -name 'frame_*.png' | wc -l)"
+          fi
+          echo "selftest exit code ${code}, ${frames} PNG frames"
+          cat selftest.log
+          if [ "${frames}" -lt 2 ]; then
+            echo "the selftest did not write the PNG frames" >&2
+            exit 1
+          fi
+          if [ "${code}" -ne 0 ]; then
+            echo "the selftest exited with ${code}" >&2
+            exit 1
+          fi
+
+      - name: Stage the Windows package
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf stage
+          mkdir -p stage
+          cp target/release/agnosis.exe stage/agnosis.exe
+          cat > stage/LICENSE.txt <<'EOF'
+          Copyright (c) 2026, Annoying Goods <marek@annoyinggoods.com>, <https://annoyinggoods.com>
+          Reserved Name: "AGnosis"
+          
+          ---
+          
+          # OPEN SOURCE LICENSE WITH ETHICAL RESTRICTIONS
+          
+          **Version 2.0**
+          
+          This software is open source.
+          Its source code is distributed with it and is licensed here, together with the compiled
+          application, free of charge, subject to the ethical restrictions below.
+          
+          ---
+          
+          ### **TERMS AND CONDITIONS FOR USE, MODIFICATION, AND DISTRIBUTION OF THE SOFTWARE**
+          
+          #### **1. DEFINITIONS**
+          
+          - **1.1. "License"** means the terms and conditions set forth herein for the use of the Software.
+          - **1.2. "Licensor"** means the copyright owner or entity authorized by the copyright owner granting this License.
+          - **1.3. "Licensee"** means an individual or entity exercising the permissions granted by this License.
+          - **1.4. "Software"** means the software in any form — the Source Code, the compiled application, its installers, and the data files and documentation that accompany them — as the Licensor distributes them, and modified versions of it as distributed by Licensee.
+          - **1.5. "Source Code"** means the human-readable form of the Software, in any form, including the source files, the build scripts, the configuration that compiles them, and the templates and corpus they assemble.
+          - **1.6. "Reserved Name"** means the name "AGnosis" and any variations or logos designated by the Licensor.
+          - **1.7. "Supply Chain"** means the sequence of processes involved in the production, operation, or distribution of goods or services by Licensee.
+          - **1.8. "Supply Chain Impacted Party"** means any person directly impacted by Licensee’s Supply Chain.
+          - **1.9. "Duty of Care"** is defined as the legal requirement to act with the watchfulness, attention, caution, and prudence that a reasonable person in similar circumstances would exercise toward a Supply Chain Impacted Party.
+          
+          ---
+          
+          #### **2. GRANT OF RIGHTS**
+          
+          - **2.1. Permitted Uses:** Subject to strict compliance with all terms of this License, Licensor grants Licensee a worldwide, non-exclusive, royalty-free license to:
+            - Use, reproduce, prepare, run, and execute the Software, in source or compiled form, for any purpose, personal, educational, research, or commercial.
+            - Make backup copies of the Software and keep them for as long as they are used.
+            - Modify the Software, and compile and prepare derivative works of it.
+            - Distribute the Software or modified versions of it, in source or compiled form, in whole or in part, with or without charge, subject to the conditions of Section 2.2.
+            - Sublicense and/or sell copies of the Software or modified versions of it, provided the recipient receives no lesser rights than this License grants and no fewer obligations than this License imposes.
+          - **2.2. Distribution Conditions:** Licensee **SHALL**, for every distribution of the Software or a modified version, in whole or in part:
+            - Include a complete copy of this License.
+            - Preserve and reproduce all copyright, trademark, patent, and attribution notices of the Licensor (Section 4.1).
+            - State in reasonable form, within the distributed materials, the changes made to the Software, if any.
+          - **2.3. Patent Grant Limitation:** This License grants **no express or implied patent licenses** to make, sell, offer to sale, import, or otherwise transfer commercial embodiments of the Software.
+          
+          ---
+          
+          #### **3. ETHICAL STANDARDS**
+          
+          The permissions granted in Section 2 are expressly contingent upon Licensee's continuous compliance with the following ethical standards.
+          The Software shall not be used by any person or entity for any systems, activities, or other uses that violate any Human Rights Laws.
+          “Human Rights Laws” means any applicable laws, regulations, or rules (collectively, “Laws”) that protect human, civil, labor, privacy, political, environmental, security, economic, due process, or similar rights; provided, however, that such Laws are consistent and not in conflict with Human Rights Principles (a dispute over the consistency of or a conflict between Laws and Human Rights Principles shall be determined by arbitration as stated above).
+          Where the Human Rights Laws of more than one jurisdiction are applicable or in conflict with respect to the use of the Software, the Human Rights Laws that are most protective of the individuals or groups harmed shall apply.
+          In particular Licensee **SHALL NOT**, directly or indirectly:
+          
+          - **3.1.** Infringe upon any person’s right to life or security of person, engage in extrajudicial killings, or commit violence (*UN Universal Declaration of Human Rights, Art. 3*).
+          - **3.2.** Hold any person in slavery, servitude, or forced labor (*UN UDHR, Art. 4*).
+          - **3.3.** Torture or subject any person to cruel, inhuman or degrading treatment or punishment (*UN UDHR, Art. 5*).
+          - **3.4.** Discriminate on the basis of sex, gender, sexual orientation, race, ethnicity, nationality, religion, caste, age, or disability (*UN UDHR, Art. 7*).
+          - **3.5.** Arbitrarily interfere with any person’s privacy, family, home or correspondence (*UN UDHR, Art. 12*).
+          - **3.6.** Participate in mass surveillance programs, conduct military combat operations, or supply products/services directly to law enforcement agencies engaging in human rights abuses.
+          - **3.7.** Engage in mineral or fossil fuel exploration, extraction, or sales listed on the Carbon Underground 200 index.
+          - **3.8.** Commit ecocide or acts causing severe, widespread, and long-term damage to the natural environment.
+          - **3.9.** Interfere with workers’ rights to associate and organize collectively (*ILO Convention No. 87*).
+          
+          ---
+          
+          #### **4. NOTICE, TRADEMARK & ACKNOWLEDGMENT**
+          
+          - **4.1. Preservation of Notices:** Licensee must maintain all original copyright, trademark, patent, and attribution notices in all copies of the Software, in whole or in part, and in all modified versions of it.
+            These notices must be included either as standalone text files, human-readable file headers, or in appropriate machine-readable metadata fields easily viewable by users.
+          - **4.2. Reserved Name:** This License does not grant permission to use the trade names, service marks, or the Reserved Name ("AGnosis") of the Licensor, except as required for reasonable and customary use in describing the origin of unmodified copies of the Software.
+            Modified versions of the Software must not use the Reserved Name in their name, title, or branding without the Licensor's prior written consent.
+          - **4.3. No Representation of Authorship:** The Licensee may not state or imply that the Licensor endorses, supports, or contributed to any use or modification the Licensee makes of the Software.
+          
+          ---
+          
+          #### **5. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY**
+          
+          - **5.1. Disclaimer of Warranty:** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+          - **5.2. Limitation of Liability:** IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          
+          ---
+          
+          #### **6. TERMINATION**
+          
+          - **6.1. Automatic Termination:** Any breach of Sections 2 (License Conditions), 3 (Ethical Standards), or 4 (Notice & Trademark) automatically and immediately terminates all rights granted under this License without notice.
+          - **6.2. Effect of Termination:** Upon termination, Licensee must immediately cease all execution, testing, and use of the Software and destroy all copies (original or modified) in Licensee’s possession or control.
+          - **6.3. Patent Litigation:** If Licensee initiates patent litigation against Licensor (including cross-claims or counterclaims), all rights under this License terminate immediately.
+          
+          ---
+          
+          #### **7. MISCELLANEOUS**
+          
+          - **7.1. Entire Agreement:** This License represents the complete agreement between Licensor and Licensee regarding use, modification, and distribution of the Software.
+          - **7.2. Alternative Licensing:** For alternative licensing arrangements or commercial support, contact the Licensor directly.
+          EOF
+
+      - name: Pack the Windows zip
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $zip = "ducks-$env:VERSION-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "stage/*" -DestinationPath $zip
+          Write-Host "packed $zip"
+
+      - name: Upload the Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: agnosis-windows-x64
+          path: ducks-${{ steps.ver.outputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS package
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both slices of the universal binary need their own std, so the
+      # targets are installed explicitly: a bare `stable` toolchain only
+      # carries the host target.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Resolve the package version
+        id: ver
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The version is read from the `[package]` table ONLY: the
+          # workspace table sits above it in Cargo.toml, and a
+          # `[workspace.package]` table would carry a `version` key of
+          # its own — a naive "the first `version =` line" grep would
+          # pick the wrong one.
+          if [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' | head -n 1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "could not resolve the package version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "building agnosis ${version}"
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked -p agnosis --target aarch64-apple-darwin
+          cargo build --release --locked -p agnosis --target x86_64-apple-darwin
+
+      - name: Assemble the app bundle
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf agnosis.app
+          mkdir -p agnosis.app/Contents/MacOS agnosis.app/Contents/Resources
+          lipo -create -output agnosis.app/Contents/MacOS/ducks \
+            target/aarch64-apple-darwin/release/ducks \
+            target/x86_64-apple-darwin/release/ducks
+          cp packaging/macos/Info.plist agnosis.app/Contents/Info.plist
+          lipo -info agnosis.app/Contents/MacOS/ducks
+
+      # The bundle version follows the crate version, so the shipped app never
+      # carries a stale CFBundleVersion.
+      - name: Stamp the bundle version
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - packaging/macos/Info.plist agnosis.app/Contents/Info.plist "${VERSION}" <<'PY'
+          import re
+          import sys
+
+          source, destination, version = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(source, encoding="utf-8").read()
+          for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+              pattern = r"(<key>" + key + r"</key>\s*<string>)([^<]*)(</string>)"
+              text, hits = re.subn(pattern, lambda match: match.group(1) + version + match.group(3), text)
+              if hits != 1:
+                  sys.exit("expected exactly one " + key + " entry, found " + str(hits))
+          open(destination, "w", encoding="utf-8").write(text)
+          print("bundle version " + version)
+          PY
+
+      - name: Smoke Test (the selftest writes the PNG frames)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf selftest_out
+          ./agnosis.app/Contents/MacOS/ducks selftest --frames 2 --out ./selftest_out
+          frames="$(find selftest_out -maxdepth 1 -name 'frame_*.png' | wc -l)"
+          echo "selftest wrote ${frames} PNG frames"
+          if [ "${frames}" -lt 2 ]; then
+            echo "the selftest did not write the PNG frames" >&2
+            exit 1
+          fi
+
+      # `hdiutil create -srcfolder` copies the *contents* of the folder into
+      # the image root, so the bundle is staged inside a directory that is
+      # handed to -srcfolder: the mounted volume then holds `agnosis.app`
+      # instead of the bundle's inner `Contents` directory.
+      - name: Build the disk image
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dmgroot dmgmount
+          mkdir -p dmgroot
+          cp -R agnosis.app dmgroot/agnosis.app
+          rm -f "ducks-${VERSION}-macos-universal.dmg"
+          hdiutil create -volname ducks -srcfolder dmgroot -ov -format UDZO "ducks-${VERSION}-macos-universal.dmg"
+          hdiutil verify "ducks-${VERSION}-macos-universal.dmg"
+
+      - name: Verify the disk image holds the app bundle
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dmgmount
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "${PWD}/dmgmount" "ducks-${VERSION}-macos-universal.dmg"
+          if [ ! -d "dmgmount/agnosis.app" ]; then
+            echo "the disk image does not hold agnosis.app at its root" >&2
+            ls -la dmgmount >&2
+            hdiutil detach "${PWD}/dmgmount" || true
+            exit 1
+          fi
+          hdiutil detach "${PWD}/dmgmount"
+
+      - name: Upload the macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ducks-macos-universal
+          path: ducks-${{ steps.ver.outputs.version }}-macos-universal.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev libasound2-dev dpkg-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve the package version
+        id: ver
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The version is read from the `[package]` table ONLY: the
+          # workspace table sits above it in Cargo.toml, and a
+          # `[workspace.package]` table would carry a `version` key of
+          # its own — a naive "the first `version =` line" grep would
+          # pick the wrong one.
+          if [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' | head -n 1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "could not resolve the package version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "building agnosis ${version}"
+
+      # `-p agnosis`: the release ships the ROOT package's binary. The
+      # workspace's default member is the root package too, so this is
+      # the same build today — but naming the package keeps the release
+      # from ever picking up a workspace member by accident.
+      - name: Build the release binary
+        run: cargo build --release --locked -p ducks
+
+      - name: Smoke Test (the selftest writes the PNG frames)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf selftest_out
+          ./target/release/agnosis selftest --frames 2 --out ./selftest_out
+          frames="$(find selftest_out -maxdepth 1 -name 'frame_*.png' | wc -l)"
+          echo "selftest wrote ${frames} PNG frames"
+          if [ "${frames}" -lt 2 ]; then
+            echo "the selftest did not write the PNG frames" >&2
+            exit 1
+          fi
+
+      - name: Assemble the package tree
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="ducks_${VERSION}"
+          rm -rf "${root}"
+          mkdir -p "${root}/DEBIAN" "${root}/usr/bin" "${root}/usr/share/applications" "${root}/usr/share/doc/ducks"
+          cp target/release/agnosis "${root}/usr/bin/ducks"
+          cp packaging/linux/ducks.desktop "${root}/usr/share/applications/ducks.desktop"
+          cp README.md "${root}/usr/share/doc/ducks/README.md"
+          cat > "${root}/usr/share/doc/ducks/copyright" <<'EOF'
+          Copyright (c) 2026, Annoying Goods <marek@annoyinggoods.com>, <https://annoyinggoods.com>
+          Reserved Name: "AGnosis"
+          
+          ---
+          
+          # OPEN SOURCE LICENSE WITH ETHICAL RESTRICTIONS
+          
+          **Version 2.0**
+          
+          This software is open source.
+          Its source code is distributed with it and is licensed here, together with the compiled
+          application, free of charge, subject to the ethical restrictions below.
+          
+          ---
+          
+          ### **TERMS AND CONDITIONS FOR USE, MODIFICATION, AND DISTRIBUTION OF THE SOFTWARE**
+          
+          #### **1. DEFINITIONS**
+          
+          - **1.1. "License"** means the terms and conditions set forth herein for the use of the Software.
+          - **1.2. "Licensor"** means the copyright owner or entity authorized by the copyright owner granting this License.
+          - **1.3. "Licensee"** means an individual or entity exercising the permissions granted by this License.
+          - **1.4. "Software"** means the software in any form — the Source Code, the compiled application, its installers, and the data files and documentation that accompany them — as the Licensor distributes them, and modified versions of it as distributed by Licensee.
+          - **1.5. "Source Code"** means the human-readable form of the Software, in any form, including the source files, the build scripts, the configuration that compiles them, and the templates and corpus they assemble.
+          - **1.6. "Reserved Name"** means the name "AGnosis" and any variations or logos designated by the Licensor.
+          - **1.7. "Supply Chain"** means the sequence of processes involved in the production, operation, or distribution of goods or services by Licensee.
+          - **1.8. "Supply Chain Impacted Party"** means any person directly impacted by Licensee’s Supply Chain.
+          - **1.9. "Duty of Care"** is defined as the legal requirement to act with the watchfulness, attention, caution, and prudence that a reasonable person in similar circumstances would exercise toward a Supply Chain Impacted Party.
+          
+          ---
+          
+          #### **2. GRANT OF RIGHTS**
+          
+          - **2.1. Permitted Uses:** Subject to strict compliance with all terms of this License, Licensor grants Licensee a worldwide, non-exclusive, royalty-free license to:
+            - Use, reproduce, prepare, run, and execute the Software, in source or compiled form, for any purpose, personal, educational, research, or commercial.
+            - Make backup copies of the Software and keep them for as long as they are used.
+            - Modify the Software, and compile and prepare derivative works of it.
+            - Distribute the Software or modified versions of it, in source or compiled form, in whole or in part, with or without charge, subject to the conditions of Section 2.2.
+            - Sublicense and/or sell copies of the Software or modified versions of it, provided the recipient receives no lesser rights than this License grants and no fewer obligations than this License imposes.
+          - **2.2. Distribution Conditions:** Licensee **SHALL**, for every distribution of the Software or a modified version, in whole or in part:
+            - Include a complete copy of this License.
+            - Preserve and reproduce all copyright, trademark, patent, and attribution notices of the Licensor (Section 4.1).
+            - State in reasonable form, within the distributed materials, the changes made to the Software, if any.
+          - **2.3. Patent Grant Limitation:** This License grants **no express or implied patent licenses** to make, sell, offer to sale, import, or otherwise transfer commercial embodiments of the Software.
+          
+          ---
+          
+          #### **3. ETHICAL STANDARDS**
+          
+          The permissions granted in Section 2 are expressly contingent upon Licensee's continuous compliance with the following ethical standards.
+          The Software shall not be used by any person or entity for any systems, activities, or other uses that violate any Human Rights Laws.
+          “Human Rights Laws” means any applicable laws, regulations, or rules (collectively, “Laws”) that protect human, civil, labor, privacy, political, environmental, security, economic, due process, or similar rights; provided, however, that such Laws are consistent and not in conflict with Human Rights Principles (a dispute over the consistency of or a conflict between Laws and Human Rights Principles shall be determined by arbitration as stated above).
+          Where the Human Rights Laws of more than one jurisdiction are applicable or in conflict with respect to the use of the Software, the Human Rights Laws that are most protective of the individuals or groups harmed shall apply.
+          In particular Licensee **SHALL NOT**, directly or indirectly:
+          
+          - **3.1.** Infringe upon any person’s right to life or security of person, engage in extrajudicial killings, or commit violence (*UN Universal Declaration of Human Rights, Art. 3*).
+          - **3.2.** Hold any person in slavery, servitude, or forced labor (*UN UDHR, Art. 4*).
+          - **3.3.** Torture or subject any person to cruel, inhuman or degrading treatment or punishment (*UN UDHR, Art. 5*).
+          - **3.4.** Discriminate on the basis of sex, gender, sexual orientation, race, ethnicity, nationality, religion, caste, age, or disability (*UN UDHR, Art. 7*).
+          - **3.5.** Arbitrarily interfere with any person’s privacy, family, home or correspondence (*UN UDHR, Art. 12*).
+          - **3.6.** Participate in mass surveillance programs, conduct military combat operations, or supply products/services directly to law enforcement agencies engaging in human rights abuses.
+          - **3.7.** Engage in mineral or fossil fuel exploration, extraction, or sales listed on the Carbon Underground 200 index.
+          - **3.8.** Commit ecocide or acts causing severe, widespread, and long-term damage to the natural environment.
+          - **3.9.** Interfere with workers’ rights to associate and organize collectively (*ILO Convention No. 87*).
+          
+          ---
+          
+          #### **4. NOTICE, TRADEMARK & ACKNOWLEDGMENT**
+          
+          - **4.1. Preservation of Notices:** Licensee must maintain all original copyright, trademark, patent, and attribution notices in all copies of the Software, in whole or in part, and in all modified versions of it.
+            These notices must be included either as standalone text files, human-readable file headers, or in appropriate machine-readable metadata fields easily viewable by users.
+          - **4.2. Reserved Name:** This License does not grant permission to use the trade names, service marks, or the Reserved Name ("AGnosis") of the Licensor, except as required for reasonable and customary use in describing the origin of unmodified copies of the Software.
+            Modified versions of the Software must not use the Reserved Name in their name, title, or branding without the Licensor's prior written consent.
+          - **4.3. No Representation of Authorship:** The Licensee may not state or imply that the Licensor endorses, supports, or contributed to any use or modification the Licensee makes of the Software.
+          
+          ---
+          
+          #### **5. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY**
+          
+          - **5.1. Disclaimer of Warranty:** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+          - **5.2. Limitation of Liability:** IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          
+          ---
+          
+          #### **6. TERMINATION**
+          
+          - **6.1. Automatic Termination:** Any breach of Sections 2 (License Conditions), 3 (Ethical Standards), or 4 (Notice & Trademark) automatically and immediately terminates all rights granted under this License without notice.
+          - **6.2. Effect of Termination:** Upon termination, Licensee must immediately cease all execution, testing, and use of the Software and destroy all copies (original or modified) in Licensee’s possession or control.
+          - **6.3. Patent Litigation:** If Licensee initiates patent litigation against Licensor (including cross-claims or counterclaims), all rights under this License terminate immediately.
+          
+          ---
+          
+          #### **7. MISCELLANEOUS**
+          
+          - **7.1. Entire Agreement:** This License represents the complete agreement between Licensor and Licensee regarding use, modification, and distribution of the Software.
+          - **7.2. Alternative Licensing:** For alternative licensing arrangements or commercial support, contact the Licensor directly.
+          EOF
+          size_kb="$(du -sk --exclude=DEBIAN "${root}" | cut -f1)"
+          sed -e "s/@VERSION@/${VERSION}/g" -e "s/@INSTALLED_SIZE@/${size_kb}/g" packaging/linux/control.in > "${root}/DEBIAN/control"
+          cat "${root}/DEBIAN/control"
+
+      # The guard against a package that installs but will not start: every
+      # shared library the binary links has to be named by the Depends line.
+      - name: Assert the Depends line covers every linked library
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "ducks_${VERSION}/DEBIAN/control" <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          # soname -> the Debian package that ships it. ldd stays the source
+          # of truth for the link-time dependencies; this map only names the
+          # package. Anything not listed here is resolved with dpkg -S.
+          SONAME_TO_PACKAGE = {
+              "libc.so.6": "libc6",
+              "libdl.so.2": "libc6",
+              "libm.so.6": "libc6",
+              "libpthread.so.0": "libc6",
+              "librt.so.1": "libc6",
+              "libresolv.so.2": "libc6",
+              "libutil.so.1": "libc6",
+              "libgcc_s.so.1": "libgcc-s1",
+              "libasound.so.2": "libasound2",
+              "libX11.so.6": "libx11-6",
+              "libXext.so.6": "libxext6",
+              "libXfixes.so.3": "libxfixes3",
+              "libXcursor.so.1": "libxcursor1",
+              "libXrandr.so.2": "libxrandr2",
+              "libXi.so.6": "libxi6",
+              "libXrender.so.1": "libxrender1",
+              "libxcb.so.1": "libxcb1",
+              "libxkbcommon.so.0": "libxkbcommon0",
+              "libxkbcommon-x11.so.0": "libxkbcommon-x11-0",
+              "libwayland-client.so.0": "libwayland-client0",
+              "libwayland-server.so.0": "libwayland-server0",
+              "libwayland-cursor.so.0": "libwayland-cursor0",
+              "libwayland-egl.so.1": "libwayland-egl1",
+              "libEGL.so.1": "libegl1",
+              "libGL.so.1": "libgl1",
+              "libGLX.so.0": "libglx0",
+              "libvulkan.so.1": "libvulkan1",
+          }
+
+          # The kernel vDSO and the ELF loader are not packaged separately.
+          IGNORE = {
+              "linux-vdso.so.1",
+              "ld-linux-x86-64.so.2",
+              "ld-linux-aarch64.so.1",
+              "ld64.so.1",
+              "ld64.so.2",
+              "ld-musl-x86_64.so.1",
+          }
+
+          def linked_sonames():
+              done = subprocess.run(["ldd", "target/release/ducks"], capture_output=True, text=True)
+              if done.returncode != 0:
+                  sys.exit("ldd failed: " + done.stderr.strip())
+              found = []
+              for line in done.stdout.splitlines():
+                  if "not found" in line:
+                      sys.exit("a linked library is missing on the runner: " + line.strip())
+                  fields = line.split("=>")[0].strip().split()
+                  if not fields:
+                      continue
+                  name = os.path.basename(fields[0])
+                  if ".so" not in name:
+                      continue
+                  found.append(name)
+              return found
+
+          def owning_packages(soname):
+              mapped = SONAME_TO_PACKAGE.get(soname)
+              if mapped:
+                  return [mapped]
+              probe = subprocess.run(["dpkg", "-S", "*/" + soname], capture_output=True, text=True)
+              if probe.returncode != 0:
+                  return []
+              owners = []
+              for line in probe.stdout.splitlines():
+                  if ":" not in line:
+                      continue
+                  for part in line.rsplit(":", 1)[0].split(","):
+                      name = part.strip().split(":")[0].strip()
+                      if name:
+                          owners.append(name)
+              return owners
+
+          def depends_packages(control_path):
+              lines = control_path.read_text(encoding="utf-8").splitlines()
+              for index, line in enumerate(lines):
+                  if not line.lower().startswith("depends:"):
+                      continue
+                  parts = [line.split(":", 1)[1]]
+                  for follow in lines[index + 1:]:
+                      if follow[:1] in (" ", "\t"):
+                          parts.append(follow.strip())
+                      else:
+                          break
+                  names = set()
+                  for part in " ".join(parts).split(","):
+                      name = part.strip().split("(")[0].strip()
+                      if name:
+                          names.add(name)
+                  return names
+              return set()
+
+          control_path = Path(sys.argv[1])
+          if not control_path.is_file():
+              sys.exit("missing " + str(control_path))
+          declared = depends_packages(control_path)
+          if not declared:
+              sys.exit("DEBIAN/control has no Depends: line")
+
+          missing = []
+          unresolved = []
+          for soname in sorted(set(linked_sonames())):
+              if soname in IGNORE:
+                  continue
+              owners = owning_packages(soname)
+              if not owners:
+                  unresolved.append(soname)
+              elif not any(owner in declared for owner in owners):
+                  missing.append(soname + " (" + ", ".join(owners) + ")")
+          if unresolved:
+              sys.exit("no Debian package found for: " + ", ".join(unresolved))
+          if missing:
+              sys.exit("DEBIAN/control Depends: is missing: " + ", ".join(missing))
+          print("Depends: covers every linked library")
+          PY
+          # The link-time closure is not the whole dependency set: winit is
+          # built with the `x11-dl` feature, so libX11, libXcursor,
+          # libXrandr, libXi, libXfixes and libxkbcommon-x11 are dlopened
+          # at runtime and `ldd` never reports them. The X11 runtime
+          # packages are listed by hand and checked on their own: without
+          # them the package installs and then fails to start.
+          python3 - "ducks_${VERSION}/DEBIAN/control" <<'PY'
+          import sys
+          from pathlib import Path
+
+          # The Debian packages that ship the X11 libraries winit dlopens
+          # at runtime. `ldd` cannot see these, so they are asserted here.
+          REQUIRED_X11_PACKAGES = [
+              "libx11-6",
+              "libxcb1",
+              "libxext6",
+              "libxfixes3",
+              "libxcursor1",
+              "libxi6",
+              "libxkbcommon0",
+              "libxkbcommon-x11-0",
+              "libxrandr2",
+          ]
+
+          def depends_packages(control_path):
+              lines = control_path.read_text(encoding="utf-8").splitlines()
+              for index, line in enumerate(lines):
+                  if not line.lower().startswith("depends:"):
+                      continue
+                  parts = [line.split(":", 1)[1]]
+                  for follow in lines[index + 1:]:
+                      if follow[:1] in (" ", "\t"):
+                          parts.append(follow.strip())
+                      else:
+                          break
+                  names = set()
+                  for part in " ".join(parts).split(","):
+                      name = part.strip().split("(")[0].strip()
+                      if name:
+                          names.add(name)
+                  return names
+              return set()
+
+          control_path = Path(sys.argv[1])
+          if not control_path.is_file():
+              sys.exit("missing " + str(control_path))
+          declared = depends_packages(control_path)
+          if not declared:
+              sys.exit("DEBIAN/control has no Depends: line")
+          missing = [name for name in REQUIRED_X11_PACKAGES if name not in declared]
+          if missing:
+              sys.exit(
+                  "DEBIAN/control Depends: is missing the X11 runtime package(s): "
+                  + ", ".join(missing)
+              )
+          print("Depends: names every X11 runtime package")
+          PY
+
+      - name: Build the deb
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          dpkg-deb --build --root-owner-group "ducks_${VERSION}" "ducks_${VERSION}_amd64.deb"
+          dpkg-deb --info "ducks_${VERSION}_amd64.deb"
+          dpkg-deb --contents "ducks_${VERSION}_amd64.deb"
+
+      - name: Upload the Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ducks-linux-amd64
+          path: ducks_${{ steps.ver.outputs.version }}_amd64.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the package version
+        id: ver
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The version is read from the `[package]` table ONLY: the
+          # workspace table sits above it in Cargo.toml, and a
+          # `[workspace.package]` table would carry a `version` key of
+          # its own — a naive "the first `version =` line" grep would
+          # pick the wrong one.
+          if [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' | head -n 1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "could not resolve the package version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the packages
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "ducks-${VERSION}-windows-x64.zip"
+            "ducks-${VERSION}-macos-universal.dmg"
+            "ducks_${VERSION}_amd64.deb"
+          )
+          for name in "${expected[@]}"; do
+            if [ ! -f "dist/${name}" ]; then
+              echo "missing artifact: ${name}" >&2
+              ls -la dist >&2
+              exit 1
+            fi
+          done
+          count="$(find dist -maxdepth 1 -type f | wc -l)"
+          if [ "${count}" -ne 3 ]; then
+            echo "expected exactly three artifacts, found ${count}" >&2
+            ls -la dist >&2
+            exit 1
+          fi
+          ls -la dist
+
+      - name: Publish to the GitHub release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" dist/* --verify-tag --generate-notes --title "${TAG}"
+          fi
+
+      - name: Note (dispatched by hand, so no release is published)
+        if: github.ref_type != 'tag'
+        run: |
+          echo "The workflow was dispatched by hand: the packages are attached to this run, but no GitHub release was created."

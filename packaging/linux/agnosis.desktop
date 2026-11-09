@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AGnosis
+GenericName=Duck parade
+Comment=Hides your browser behind a fullscreen ASCII duck parade
+Exec=agnosis
+Terminal=false
+Categories=Utility;
+Keywords=duck;ascii;parade;fun;

@@ -1,0 +1,22 @@
+Package: agnosis
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: mrmflis-hub <noreply@github.com>
+Installed-Size: @INSTALLED_SIZE@
+Build-Depends: libasound2-dev
+Depends: libc6 (>= 2.31), libgcc-s1, libasound2 (>= 1.0.24), libx11-6, libxcb1, libxext6, libxfixes3, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libxrandr2
+Description: Global hotkey that hides your browser behind a fullscreen ASCII duck parade
+ AGnosis is a single-binary daemon. The global hotkey minimizes every open
+ browser window and opens a borderless fullscreen window that renders an
+ animated ASCII duck parade: grass, marching ducks, and balloons on ropes.
+ .
+ The binary is built against the X11 backend of winit, so the X11 runtime
+ libraries above are required. On a Wayland-only session it runs through
+ XWayland.
+ .
+ The parade can play a MIDI note track and make the ducks react to the
+ mouse, so the binary is linked against ALSA: the sound device is opened
+ at run time and the app runs silent when there is none. The ALSA headers
+ are needed to build the binary, the runtime library to run it.

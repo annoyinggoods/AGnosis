@@ -1,0 +1,31 @@
+[package]
+name = "agnosis-core"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.90"
+description = "The pure simulation core of the AGnosis ASCII duck parade"
+license-file = "../../LICENSE.txt"
+publish = false
+
+[lib]
+name = "agnosis_core"
+path = "src/lib.rs"
+
+[features]
+# The **test-support** helpers: the accessors and the sprite builders that
+# only the core's own test suite used (`#[cfg(test)]` before the split).
+# The binary crate's own tests need a few of them too, and a `cfg(test)`
+# item is invisible to *another* crate — so the gate is widened to
+# "the core's own tests, or a crate that asked for the helpers".
+#
+# The feature is OFF by default: a release build of the core carries
+# exactly the same public surface it had before the split.
+test-support = []
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+ab_glyph = "0.2.32"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+thiserror = "2.0.21"

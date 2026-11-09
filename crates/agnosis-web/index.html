@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AGnosis — the ASCII duck parade</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #000; color: #cfcfcf;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  /* The canvas fills the window; its drawing buffer holds the grid's
+     pixels exactly, so the browser does the (integer) scaling. */
+  #canvas {
+    display: block; width: 100vw; height: 100vh;
+    background: #000; image-rendering: pixelated;
+  }
+  #bar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 2;
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, .72); border-bottom: 1px solid #222;
+  }
+  #bar label { display: inline-flex; gap: 5px; align-items: center; }
+  select, button, input[type="file"] {
+    font: inherit; color: #cfcfcf; background: #141414;
+    border: 1px solid #333; border-radius: 3px; padding: 2px 6px;
+  }
+  button:hover, select:hover { border-color: #666; }
+  #status { margin-left: auto; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* The diagnostic box: a headless smoke test reads the failures out of
+     the DOM. It is empty (and invisible) when nothing went wrong. */
+  #diag {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 3;
+    max-height: 32vh; overflow: auto; margin: 0; padding: 6px 10px;
+    background: rgba(40, 0, 0, .88); color: #ffb4b4;
+    white-space: pre-wrap; font-size: 11px;
+  }
+  #diag:empty { display: none; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="bar">
+  <label>backend
+    <select id="backend">
+      <option value="auto" selected>auto</option>
+      <option value="webgpu">webgpu</option>
+      <option value="webgl2">webgl2</option>
+      <option value="canvas2d">canvas2d</option>
+    </select>
+  </label>
+  <button id="pause" type="button">pause</button>
+  <label title="load your own art: a .agnosis package or a manifest .json that the native `agnosis export` / `agnosis config export` wrote">art (.agnosis / manifest) <input id="file" type="file" accept=".agnosis,.json,application/json"></label>
+  <span id="status">starting…</span>
+</div>
+
+<pre id="diag"></pre>
+
+<script>
+/* The error trap.
+   A classic script, so it is installed BEFORE the module below and
+   catches a failed glue load as well. Everything that goes wrong ends
+   up in #diag, which is what the headless smoke test reads. */
+(function () {
+  var diag = document.getElementById('diag');
+  function note(line) {
+    try {
+      diag.textContent = (diag.textContent || '') + line + '\n';
+    } catch (e) { /* no box: nothing to do */ }
+  }
+  window.__agnosisNote = note;
+  window.addEventListener('error', function (e) {
+    note('error: ' + ((e && e.message) || e));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    note('unhandledrejection: ' + ((r && r.message) || r));
+  });
+  var consoleError = console.error.bind(console);
+  console.error = function () {
+    var args = Array.prototype.slice.call(arguments);
+    note('console.error: ' + args.map(String).join(' '));
+    consoleError.apply(null, args);
+  };
+})();
+</script>
+
+<script type="module">
+/* The glue is what `wasm-bindgen --target web` writes next to the
+   .wasm: agnosis_web.js plus agnosis_web_bg.wasm. No network, no CDN. */
+import init, {
+  backend_name,
+  set_backend,
+  set_paused,
+  apply_manifest,
+  load_package,
+  status_line
+} from './agnosis_web.js';
+
+const note = (line) => window.__agnosisNote(line);
+const statusEl = document.getElementById('status');
+const backendEl = document.getElementById('backend');
+const pauseEl = document.getElementById('pause');
+const fileEl = document.getElementById('file');
+
+/* A message that stays in the status line for a few seconds (an import
+   summary), so the diagnostic box keeps its one job: the failures. */
+let sticky = '';
+
+function refresh() {
+  try {
+    statusEl.textContent = sticky || status_line();
+    statusEl.title = 'running on the ' + backend_name() + ' back end';
+  } catch (e) {
+    note('status: ' + ((e && e.message) || e));
+  }
+}
+
+function say(text) {
+  sticky = text;
+  refresh();
+  setTimeout(() => {
+    sticky = '';
+    refresh();
+  }, 5000);
+}
+
+try {
+  await init();
+} catch (e) {
+  const why = (e && e.message) || String(e);
+  note('init failed: ' + why);
+  // The failure goes to the **status line** — the top bar is always on
+  // screen, while the diagnostic box sits at the bottom behind a black
+  // canvas and read like nothing had happened (audit 2026-10-22 §UX-03).
+  let message = 'the parade could not start: ' + why;
+  // A `file://` URL cannot serve the .wasm with the content type the
+  // streaming instantiation requires, so THIS failure is the likely
+  // one — say so where the user is looking (audit 2026-10-23 F-145).
+  if (location.protocol === 'file:') {
+    message += ' — this page was opened from a file: URL; serve the folder over HTTP (see the README)';
+    note('file: URL detected; the bundle must be served over HTTP');
+  }
+  statusEl.textContent = message;
+  statusEl.title = why;
+  // No re-throw: the page STAYS honest and still (the diagnostic box
+  // carries the detail), and the error trap would only print the same
+  // words a second time (audit 2026-10-23 F-145).
+}
+
+backendEl.addEventListener('change', () => {
+  try {
+    set_backend(backendEl.value);
+  } catch (e) {
+    note('backend: ' + ((e && e.message) || e));
+  }
+  refresh();
+});
+
+/* The forced back end, from the URL: `?backend=webgl2` (or auto, webgpu,
+   canvas2d). The wasm boots asynchronously, so the request can arrive
+   before the app is up — the app remembers it and applies it when it
+   boots. The poll waits for a back end to be reported before asking,
+   so the request is never lost. */
+const forced = new URLSearchParams(location.search).get('backend');
+if (forced) {
+  const timer = setInterval(() => {
+    if (backend_name() !== 'none') {
+      clearInterval(timer);
+      try {
+        set_backend(forced);
+        backendEl.value = forced;
+        refresh();
+      } catch (e) {
+        note('backend: ' + ((e && e.message) || e));
+      }
+    }
+  }, 100);
+}
+
+let paused = false;
+pauseEl.addEventListener('click', () => {
+  paused = !paused;
+  try {
+    set_paused(paused);
+  } catch (e) {
+    note('pause: ' + ((e && e.message) || e));
+  }
+  pauseEl.textContent = paused ? 'resume' : 'pause';
+  refresh();
+});
+
+/* The drawn art travels: a .agnosis package (the native `agnosis export`
+   output) or a bare manifest (the native `agnosis config export`
+   output). The bytes decide which. */
+fileEl.addEventListener('change', async (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const isZip = bytes.length > 3 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+    const summary = isZip
+      ? load_package(bytes)
+      : apply_manifest(new TextDecoder().decode(bytes));
+    say('imported: ' + summary);
+  } catch (e) {
+    note('import failed: ' + ((e && e.message) || e));
+  }
+  refresh();
+});
+
+/* The canvas' own clicks are handled by the wasm (src/input.rs): a
+   click makes a duck jump, a shift-click holds it. `poke_duck` is the
+   same path, exported for a page that wants to drive it itself. */
+refresh();
+setInterval(refresh, 500);
+</script>
+</body>
+</html>

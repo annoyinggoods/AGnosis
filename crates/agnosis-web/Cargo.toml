@@ -1,0 +1,37 @@
+[package]
+name = "agnosis-web"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.90"
+description = "The AGnosis ASCII duck parade, in a browser tab"
+license-file = "../../LICENSE.txt"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "agnosis_web"
+path = "src/lib.rs"
+
+[dependencies]
+agnosis-core = { path = "../agnosis-core" }
+
+# The drawing back ends (src/render). The `webgpu` feature is the
+# browser's WebGPU and the `webgl` feature is the browser's WebGL2
+# (`wgpu-hal`'s `gles/web.rs`) — the `gles` feature is the *native* GLES
+# path and has nothing to do with the browser. `wgsl` compiles the
+# fullscreen-quad shader; `std` is what the browser build needs.
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "std", "webgpu", "webgl"] }
+
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+js-sys = { version = "=0.3.106", default-features = false, features = ["std"] }
+web-sys = { version = "=0.3.106", default-features = false, features = [
+    "std",
+    "Document", "Element", "HtmlElement", "Node", "Window", "Navigator", "Location",
+    "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "OffscreenCanvas",
+    "Event", "EventTarget", "MouseEvent", "KeyboardEvent", "WheelEvent",
+    "File", "FileList", "Blob", "BlobPropertyBag",
+    "console", "Performance", "DomRect", "DomRectReadOnly", "CssStyleDeclaration", "Url",
+]}
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = ["crates/agnosis-core", "crates/agnosis-web"]
+
+[package]
+name = "agnosis"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Global hotkey that hides your browser behind a fullscreen ASCII duck parade"
+license-file = "LICENSE.txt"
+default-run = "agnosis"
+
+[dependencies]
+agnosis-core = { path = "crates/agnosis-core" }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "x11-dl", "x11rb"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "dx12", "vulkan", "metal", "gles"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+notify = "8.2.0"
+serde_json = "1.0.151"
+toml = "1.1.6"
+directories = "6.0.0"
+clap = { version = "4.6.7", features = ["derive"] }
+thiserror = "2.0.21"
+pollster = "1.0.1"
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-manifest = "1.2.0"
+# The .ico -> resource compiler for the application icon (Windows only).
+# A build-time tool: no runtime dependency is added.
+winresource = "0.1.27"
+
+[dev-dependencies]
+# The core's test-support helpers (the accessors the shell's own tests
+# need) are behind a feature: `cfg(test)` alone would hide them from
+# this crate, which is a *different* crate from the core.
+agnosis-core = { path = "crates/agnosis-core", features = ["test-support"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `randr` adds the XRandR extension bindings the non-Windows monitor probe
+# uses (audit P1-14). It only turns on feature flags of the already vendored
+# `x11rb-protocol`, so the dependency graph (and Cargo.lock) is unchanged.
+x11rb = { version = "0.14.0", features = ["record", "randr", "allow-unsafe-code"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+# NSResponder is not optional in practice: objc2-app-kit gates the `NSView`
+# and `NSWindow` *types* behind `NSResponder` as well, so without it the
+# macOS popup path fails to compile (audit D3). NSColor carries the
+# `backgroundColor` setter the black-background step needs.
+# NSScreen enumerates the displays and NSEvent carries the pointer position
+# for the non-Windows monitor probe (audit P1-14). Both only turn on feature
+# flags of the already vendored `objc2-foundation`, so Cargo.lock is unchanged.
+# NSStatusBar/NSStatusItem/NSMenu/NSMenuItem carry the menu-bar trigger
+# (roadmap Stage 3B, decision D21); they only turn on feature flags of the
+# already vendored crates, so Cargo.lock stays unchanged.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWorkspace", "NSRunningApplication", "NSWindow", "NSView", "NSResponder", "NSColor", "NSApplication", "NSScreen", "NSEvent", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem"] }
+# The macOS global hotkey backend (roadmap Stage 3A, decision D20): a
+# listen-only `CGEventTap` observes every key event, and its `CFMachPort`
+# becomes a `CFRunLoopSource` on the hotkey thread. Both crates are
+# already in Cargo.lock via `objc2-app-kit`; these are *direct* deps now.
+# `CGEvent`+`CGEventTypes` carry the tap API and the event types,
+# `CFRunLoop`/`CFMachPort`/`CFDate` the run loop the tap is driven on.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop", "CFMachPort", "CFDate"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

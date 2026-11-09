@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AGnosis — a parade</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #e8e8e8;
+        --dim: #8a8a8a;
+        --bg: #101014;
+        --panel: #1a1a20;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        gap: 0.75rem;
+        padding: 0.75rem;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 0.75rem;
+      }
+      h1 {
+        font-size: 1rem;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      #info {
+        color: var(--dim);
+        font-size: 0.85rem;
+      }
+      .stage {
+        flex: 1 1 auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 0;
+        background: #000;
+        border: 1px solid #26262e;
+      }
+      canvas {
+        display: block;
+        max-width: 100%;
+        max-height: 100%;
+        width: auto;
+        height: auto;
+        image-rendering: pixelated;
+      }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        background: var(--panel);
+        border: 1px solid #26262e;
+        padding: 0.5rem 0.75rem;
+      }
+      button {
+        font: inherit;
+        color: var(--ink);
+        background: #26262e;
+        border: 1px solid #3a3a46;
+        border-radius: 3px;
+        padding: 0.2rem 0.9rem;
+        cursor: pointer;
+        min-width: 5rem;
+      }
+      button:hover {
+        background: #33333d;
+      }
+      input[type="range"] {
+        flex: 1 1 auto;
+        accent-color: #ffd250;
+      }
+      footer {
+        color: var(--dim);
+        font-size: 0.75rem;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1 id="title">a parade</h1>
+      <span id="info">made with AGnosis</span>
+    </header>
+    <div class="stage"><canvas id="stage"></canvas></div>
+    <div class="controls">
+      <button id="play" type="button">pause</button>
+      <input id="scrub" type="range" min="0" max="0" step="1" value="0" />
+    </div>
+    <footer>
+      A single self-contained file: no network, no assets, no fonts. Made
+      with <strong>AGnosis</strong>.
+    </footer>
+    <script id="agnosis-blob" type="text/plain">@@AGNOSIS_BLOB@@</script>
+    <script id="agnosis-manifest" type="application/json">@@AGNOSIS_MANIFEST@@</script>
+    <script>
+      @@AGNOSIS_SCRIPT@@
+    </script>
+  </body>
+</html>
