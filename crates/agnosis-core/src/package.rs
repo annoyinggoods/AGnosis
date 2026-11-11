@@ -670,6 +670,19 @@ pub fn export_to(
     manifest: &Manifest,
     assets: &[AssetPayload],
 ) -> Result<(), PackageError> {
+    let bytes = export_bytes(manifest, assets)?;
+    write_bytes(path, &bytes)?;
+    Ok(())
+}
+
+/// The package's bytes: the manifest plus the asset documents, in one
+/// store-only ZIP.
+///
+/// WHY the split: a host with no file system (the browser) downloads
+/// the bytes instead of writing a file, and the assembly must not
+/// drift between the two callers — [`export_to`] is this plus the
+/// write.
+pub fn export_bytes(manifest: &Manifest, assets: &[AssetPayload]) -> Result<Vec<u8>, PackageError> {
     manifest.validate()?;
     check_payloads_match(manifest, assets)?;
     let mut writer = ZipWriter::new();
@@ -682,9 +695,7 @@ pub fn export_to(
         })?;
         writer.add_file(&asset.file, &payload.bytes)?;
     }
-    let bytes = writer.finish()?;
-    write_bytes(path, &bytes)?;
-    Ok(())
+    Ok(writer.finish()?)
 }
 
 /// Write just the manifest as JSON — what `agnosis config export` produces.
@@ -1196,6 +1207,25 @@ mod tests {
         }
         let err = ZipArchive::parse(bytes).expect_err("an unsafe name is refused");
         assert!(matches!(err, ZipError::UnsafeName { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_bytes_export_matches_the_file_export() {
+        // The browser downloads the bytes; the shell writes the file.
+        // One assembly, so the two outputs must be identical.
+        let root = temp_dir("bytes-parity");
+        let mut manifest = Manifest::from_config(&Config::default(), "my pack");
+        manifest.add_asset(DrawnKind::Sprite, "sprite-1");
+        let payload = AssetPayload {
+            kind: DrawnKind::Sprite,
+            name: "sprite-1".to_string(),
+            bytes: sprite_bytes(&small_sprite()),
+        };
+        let path = root.join("out.agnosis");
+        export_to(&path, &manifest, std::slice::from_ref(&payload)).expect("file export");
+        let from_file = std::fs::read(&path).expect("read the file back");
+        let from_bytes = export_bytes(&manifest, &[payload]).expect("byte export");
+        assert_eq!(from_file, from_bytes, "the two exports carry the same ZIP");
     }
 
     #[test]

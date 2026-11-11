@@ -12,11 +12,14 @@
 //!
 //! * [`app`] — the frame loop, the canvas and the clock.
 //! * [`assets_io`] — the drawn art in memory and the two imports.
+//! * [`export_io`] — the three downloads: the page, the GIF and the
+//!   art package.
 //! * [`input`] — the mouse.
 //! * [`render`] — the drawing back ends (WebGPU, WebGL2, the 2D canvas).
 
 mod app;
 mod assets_io;
+mod export_io;
 mod input;
 pub mod render;
 
@@ -98,6 +101,36 @@ pub fn apply_manifest(json: &str) -> Result<String, String> {
 #[wasm_bindgen]
 pub fn load_package(bytes: &[u8]) -> Result<String, String> {
     assets_io::load_package(bytes)
+}
+
+/// Export the parade as the **self-contained page** (`.html`), as bytes.
+///
+/// The recorder drives its own scene at a fixed timestep — the export
+/// is a pure function of the config and the in-memory store, not of
+/// the live parade on the screen. The page wraps the bytes in a `Blob`
+/// and downloads them (roadmap WASM §5).
+#[wasm_bindgen]
+pub fn export_html(name: &str) -> Result<Vec<u8>, String> {
+    export_io::export_html(name)
+}
+
+/// Export the parade as the **animated GIF** (`.gif`), as bytes.
+///
+/// `scale` is the GIF's downscale factor — 2 halves the cell pitch and
+/// keeps the app's shape, the same default the native CLI uses.
+#[wasm_bindgen]
+pub fn export_gif(scale: u32) -> Result<Vec<u8>, String> {
+    export_io::export_gif(scale)
+}
+
+/// Export the store's drawn art as a **package** (`.agnosis`), as bytes.
+///
+/// The same store-only ZIP the native app writes, so a visitor can
+/// round-trip their art: what a package imported here becomes is
+/// downloadable and importable back into the native app.
+#[wasm_bindgen]
+pub fn export_package(name: &str) -> Result<Vec<u8>, String> {
+    export_io::export_package(name)
 }
 
 /// The one-line summary for the page's status bar.

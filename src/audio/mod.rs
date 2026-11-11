@@ -241,6 +241,30 @@ struct Control {
     open_device: AtomicBool,
 }
 
+/// What the worker does after a session ends.
+enum AfterSession {
+    /// Normal end, or the parade is stopping: leave.
+    Stop,
+    /// The device died for the first time: open it again.
+    Restart,
+    /// The device died again: give up and run silent.
+    GiveUp,
+}
+
+/// The restart-once ladder (audit 101126 §S6): a device that dies is
+/// restarted **once**; a second death is the end — permanent silence is
+/// the documented "no sound card is a normal case" outcome, never an
+/// error. Pure, so the ladder is testable without a sound card.
+fn after_session(sessions: usize, died: bool, stopping: bool) -> AfterSession {
+    if !died || stopping {
+        AfterSession::Stop
+    } else if sessions > 1 {
+        AfterSession::GiveUp
+    } else {
+        AfterSession::Restart
+    }
+}
+
 /// The audio worker's loop: open the device, play, and survive its
 /// disappearance.
 fn worker_loop(shared: Arc<Shared>) {
@@ -264,15 +288,17 @@ fn worker_loop(shared: Arc<Shared>) {
         };
         sessions += 1;
         let died = run_session(&shared, sink, &failed);
-        if !died || shared.is_stopping() {
-            return;
+        match after_session(sessions, died, shared.is_stopping()) {
+            AfterSession::Stop => return,
+            AfterSession::GiveUp => {
+                agnosis_core::trace::warn("audio: the device died again, giving up (silent)");
+                silent_loop(&shared);
+                return;
+            }
+            AfterSession::Restart => {
+                agnosis_core::trace::warn("audio: the device died, restarting it once");
+            }
         }
-        if sessions > 1 {
-            agnosis_core::trace::warn("audio: the device died again, giving up (silent)");
-            silent_loop(&shared);
-            return;
-        }
-        agnosis_core::trace::warn("audio: the device died, restarting it once");
     }
 }
 
@@ -574,6 +600,26 @@ impl rodio::Source for QueueSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_device_is_restarted_once_then_given_up() {
+        // The documented ladder (audit 101126 §S6): one death restarts,
+        // a second death gives up, and a stop always wins.
+        assert!(matches!(
+            after_session(1, true, false),
+            AfterSession::Restart
+        ));
+        assert!(matches!(
+            after_session(2, true, false),
+            AfterSession::GiveUp
+        ));
+        assert!(matches!(
+            after_session(3, true, false),
+            AfterSession::GiveUp
+        ));
+        assert!(matches!(after_session(2, true, true), AfterSession::Stop));
+        assert!(matches!(after_session(1, false, false), AfterSession::Stop));
+    }
 
     /// A context with no worker: the queue is never drained, so the
     /// drop-oldest rule can be asserted without racing the worker.

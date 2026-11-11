@@ -469,6 +469,51 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_fed_modifier_self_heals_a_stale_press() {
+        // The macOS backend feeds the modifier **mask** of every event,
+        // so a stale "held" heals on the next event that reports it up —
+        // the missed-key-up case the edge-fed backends cannot see
+        // (audit 101126 §S5).
+        let mut m = ChordMatcher::new("D+Shift").unwrap();
+        m.on_modifier(Modifier::Shift, true);
+        assert!(m.on_key(Key::Char('d'), true), "the chord fires");
+        // The key-up re-arms the latch; its return is always false.
+        m.on_key(Key::Char('d'), false);
+        m.on_modifier(Modifier::Shift, false);
+        assert!(
+            !m.on_key(Key::Char('d'), true),
+            "the stale modifier healed: no chord without Shift"
+        );
+        m.on_modifier(Modifier::Shift, true);
+        assert!(
+            m.on_key(Key::Char('d'), true),
+            "and it fires when Shift is really held again"
+        );
+    }
+
+    /// The Windows recovery hatch: a listener that starts mid-press or
+    /// loses a key-up leaves `held` polluted, and `clear_held` must
+    /// restore the exact firing semantics (audit 101126 §S5). Windows
+    /// only: the shared matcher behind the mutex is the only one that
+    /// can carry the poison.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn clear_held_restores_the_exact_firing_semantics() {
+        let mut m = ChordMatcher::new("D+Shift").unwrap();
+        m.on_modifier(Modifier::Shift, true);
+        assert!(m.on_key(Key::Char('d'), true));
+        // The Shift-up is eaten by another hook; the stale modifier
+        // would fire every future D without the recovery.
+        m.clear_held();
+        assert!(
+            !m.on_key(Key::Char('d'), true),
+            "no chord while Shift only looks held"
+        );
+        m.on_modifier(Modifier::Shift, true);
+        assert!(m.on_key(Key::Char('d'), true), "and fires once it is held");
+    }
+
+    #[test]
     fn matcher_fires_on_last_key_down_edge() {
         let mut m = ChordMatcher::new("A+G+Shift+Space").unwrap();
         m.on_modifier(Modifier::Shift, true);

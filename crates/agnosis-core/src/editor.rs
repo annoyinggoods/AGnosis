@@ -667,6 +667,28 @@ pub enum TrackRequest {
     },
 }
 
+/// Where the strip stands relative to its track file.
+///
+/// This is the **declared** form of what used to be two independent
+/// bools (`track_saved` + `track_loaded`): the pair encoded six states of
+/// which only three were reachable, and an impossible one — "saved but
+/// never read" — was expressible (audit 101126 §C3). The pending
+/// save/load/select job stays a typed [`TrackRequest`] in
+/// [`EditorState::track_request`]; this enum owns exactly the sync state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackSync {
+    /// No track file has been read into the strip yet: the configured
+    /// track is read the first time the strip mode opens.
+    Fresh,
+    /// The strip holds exactly what the track file holds — or holds
+    /// nothing, matching a file that is not there (a failed first read
+    /// lands here too: the empty strip is the truth).
+    Synced,
+    /// The strip holds notes the file does not: unsaved work the exit
+    /// path must ask about.
+    Dirty,
+}
+
 /// What a track write did.
 ///
 /// The outcome is the **only** thing the strip learns from the worker:
@@ -1576,13 +1598,11 @@ pub struct EditorState {
     pub strip_undo: StripUndo,
     /// The names of the track files that exist, read when the mode opens.
     pub tracks: Vec<String>,
-    /// True while the strip holds exactly what the track file holds.
-    pub track_saved: bool,
-    /// True once a track file has been read into the strip.
-    ///
-    /// The strip keeps its notes when the mode is left and entered
-    /// again: switching the mode never throws the user's work away.
-    pub track_loaded: bool,
+    /// Where the strip stands relative to its track file
+    /// ([`TrackSync`]). The strip keeps its notes when the mode is left
+    /// and entered again: switching the mode never throws the user's
+    /// work away.
+    pub track_sync: TrackSync,
     /// The track job the app still has to carry out.
     ///
     /// The state never touches the file system: it asks, and the worker
@@ -1689,8 +1709,7 @@ impl EditorState {
             pitch: 0,
             strip_undo: StripUndo::new(),
             tracks: Vec::new(),
-            track_saved: true,
-            track_loaded: false,
+            track_sync: TrackSync::Fresh,
             track_request: None,
             platform: EditorPlatform::default(),
             tracks_dir: None,
@@ -1989,12 +2008,20 @@ impl EditorState {
     /// line says so.
     pub fn set_frames(&mut self, n: usize) {
         let wanted = n.clamp(1, 4);
+        let changed = wanted != self.frames_wanted || self.frames.len() > wanted;
         self.frames_wanted = wanted;
         let surplus = self.frames.len().saturating_sub(wanted);
         if surplus > 0 {
             self.frames.truncate(wanted);
             let plural = if surplus == 1 { "" } else { "S" };
             self.set_toast(&format!("DROPPED {surplus} FRAME{plural}"));
+        }
+        // The count and the finished frames are draft-relevant content
+        // (`DraftDoc` carries both), so the autosave must hear about the
+        // change now and not with the next stroke — a stale draft used to
+        // resurrect dropped frames on reload (audit 101126 §B4).
+        if changed {
+            self.mark_dirty();
         }
         self.refresh_status();
     }
@@ -2198,6 +2225,11 @@ impl EditorState {
     /// Returns `true` when a stroke was undone. The undo never touches
     /// the name field: only the canvas changes.
     pub fn undo(&mut self) -> bool {
+        // A stroke still open (a lost pointer-up) belongs to the undo
+        // being asked for: closing it first puts its wet cells on the
+        // stack instead of leaving them un-undoable on the canvas
+        // (audit 101126 §C1).
+        self.end_stroke();
         let Some(stroke) = self.undo.pop_undo() else {
             return false;
         };
@@ -2266,11 +2298,12 @@ impl EditorState {
     /// canvas do not describe this one. The drawing is marked dirty: it
     /// is unsaved work, and it must survive a crash exactly as it was.
     ///
-    /// A balloon or a grass tile is **one frame, always** (mirroring
-    /// [`EditorState::set_kind`]): a draft that claims otherwise — a
-    /// hand-edited file, or a file from an older build — is mended on
-    /// load instead of putting the editor in a state the kind cannot
-    /// save (audit 2026-10-23 §R6-05).
+    /// A draft that carries more frames than the kind holds is **mended
+    /// on load**: a balloon or a grass tile is one frame, always
+    /// (mirroring [`EditorState::set_kind`]), and a sprite is truncated
+    /// to its own frame count — the surplus used to reload into
+    /// `frames.len() > frames_wanted` and was saved back with the
+    /// surplus (audit 101126 §B3).
     pub fn load_draft(&mut self, doc: &crate::drawn::DraftDoc) {
         self.kind = doc.kind;
         self.size = doc.size.unwrap_or(crate::drawn::DrawnSize::Big);
@@ -2283,12 +2316,9 @@ impl EditorState {
         }
         self.frame_index = doc.frame_index.min(self.frames_wanted.saturating_sub(1));
         self.frames = doc.frames.iter().filter_map(frame_from_doc).collect();
-        if matches!(
-            doc.kind,
-            crate::drawn::DrawnKind::Balloon | crate::drawn::DrawnKind::Grass
-        ) {
-            self.frames.truncate(1);
-        }
+        // One rule for every kind: the frames a draft carries beyond the
+        // count the kind holds are dropped here, never re-saved.
+        self.frames.truncate(self.frames_wanted);
         self.canvas =
             frame_from_doc(&doc.canvas).unwrap_or_else(|| crate::balloon::AsciiSprite::new(0, 0));
         if !doc.name.is_empty() {
@@ -2872,6 +2902,10 @@ impl EditorState {
         self.frame_index += 1;
         self.undo.clear();
         self.stroke = None;
+        // The draft carries the finished frames and the index, so the
+        // frame split is draft-relevant content: the autosave used to
+        // lag until the next stroke (audit 101126 §B4).
+        self.mark_dirty_at(now);
         self.set_toast_at(NEXT_FRAME_TOAST, now);
         self.refresh_status();
     }
@@ -2899,10 +2933,22 @@ impl EditorState {
             Ok(_) => {
                 // The asset is on disk, so the draft has done its job:
                 // saving the asset deletes the draft (roadmap Extension 2
-                // §2.2).
+                // §2.2). A draft written under a **renamed** asset leaves
+                // its old file behind — nulling `draft_key` alone
+                // orphaned it and later sessions re-offered it forever
+                // (audit 101126 §B1).
+                let stale = self
+                    .draft_key
+                    .take()
+                    .filter(|(k, n)| *k != kind || *n != name);
+                if let Some((old_kind, old_name)) = stale {
+                    self.draft_actions.push(DraftAction::Delete {
+                        kind: old_kind,
+                        name: old_name,
+                    });
+                }
                 self.queue_draft_delete(name.as_str());
                 self.draft_offer = None;
-                self.draft_key = None;
                 self.draft_dirty = false;
                 self.draft_due = None;
                 self.set_toast_at(&format!("SAVED {}", name.to_uppercase()), now);
@@ -3483,7 +3529,7 @@ impl EditorState {
         // The notes and the name are **kept**: switching the mode never
         // throws the user's work away (roadmap Stage 9). The configured
         // track is read the first time the strip is opened.
-        if !self.track_loaded {
+        if self.track_sync == TrackSync::Fresh {
             self.track_name = config.audio.track.clone().unwrap_or_default();
             self.load_the_configured_track(dir);
         }
@@ -3508,7 +3554,9 @@ impl EditorState {
         if name.is_empty() {
             return;
         }
-        self.track_loaded = true;
+        // The configured-track read is attempted exactly once: whatever
+        // it found (the file, or nothing) is what the strip now holds.
+        self.track_sync = TrackSync::Synced;
         let Some(dir) = dir else {
             return;
         };
@@ -3618,7 +3666,7 @@ impl EditorState {
             before,
             after,
         });
-        self.track_saved = false;
+        self.track_sync = TrackSync::Dirty;
         self.refresh_status();
     }
 
@@ -3653,7 +3701,7 @@ impl EditorState {
                 self.track.remove(&delta.step);
             }
         }
-        self.track_saved = false;
+        self.track_sync = TrackSync::Dirty;
         self.refresh_status();
     }
 
@@ -3748,7 +3796,7 @@ impl EditorState {
     /// window, and nothing anywhere said so (audit 2026-10-23 §X-04).
     /// An empty strip is not unsaved work — there is nothing to lose.
     pub fn track_unsaved(&self) -> bool {
-        !self.track_saved && !self.track.is_empty()
+        self.track_sync == TrackSync::Dirty && !self.track.is_empty()
     }
 
     /// Carry a pending track save out **now**, on the caller's thread.
@@ -3793,15 +3841,14 @@ impl EditorState {
     pub fn apply_track_outcome(&mut self, outcome: &TrackOutcome, now: Instant) {
         match outcome {
             TrackOutcome::Saved { name } => {
-                self.track_saved = true;
+                self.track_sync = TrackSync::Synced;
                 self.set_toast_at(&format!("SAVED {}", name.to_uppercase()), now);
             }
             TrackOutcome::Loaded { name, track } => {
                 self.track = crate::audio::sequencer::normalise_track(track, self.strip_steps);
                 self.track_name = name.clone();
                 self.strip_undo.clear();
-                self.track_saved = true;
-                self.track_loaded = true;
+                self.track_sync = TrackSync::Synced;
                 self.set_toast_at(&format!("LOADED {}", name.to_uppercase()), now);
             }
             TrackOutcome::Selected { name } => {
@@ -9029,6 +9076,189 @@ mod tests {
     }
 
     #[test]
+    fn the_debounce_fires_after_a_second_of_quiet() {
+        // One write per second of quiet, not per cell (roadmap Extension
+        // 2 §2.2): a moment short of the second is not due yet.
+        let mut state = state();
+        let now = Instant::now();
+        assert!(!state.draft_is_due(now), "a clean state is never due");
+        state.mark_dirty_at(now);
+        assert!(!state.draft_is_due(now + Duration::from_millis(999)));
+        assert!(state.draft_is_due(now + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn a_renamed_draft_deletes_the_old_file_before_writing_the_new() {
+        // The drafts folder must not fill up with one drawing's
+        // intermediate names, and the delete goes first: a kill between
+        // the two actions leaves the old checkpoint, never nothing
+        // (audit 101126 §C2).
+        let mut state = state();
+        state.name = "old".to_string();
+        state.queue_draft_write();
+        state.name = "new".to_string();
+        state.queue_draft_write();
+        let actions = state.take_draft_actions();
+        assert_eq!(actions.len(), 3, "the old write, the delete, the new write");
+        assert!(
+            matches!(&actions[1], DraftAction::Delete { name, .. } if name.as_str() == "old"),
+            "the old name is deleted"
+        );
+        assert!(
+            matches!(&actions[2], DraftAction::Write { name, .. } if name.as_str() == "new"),
+            "the new name is written last"
+        );
+    }
+
+    #[test]
+    fn asking_twice_for_the_same_draft_queues_no_delete() {
+        let mut state = state();
+        state.name = "same".to_string();
+        state.queue_draft_write();
+        state.queue_draft_write();
+        let actions = state.take_draft_actions();
+        assert!(
+            actions.iter().all(|action| {
+                matches!(action, DraftAction::Write { name, .. } if name.as_str() == "same")
+            }),
+            "the same name never queues a delete: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn saving_under_a_new_name_deletes_the_old_draft_too() {
+        // A draft written under the pre-rename name used to be orphaned
+        // forever by a save under the new one — every later session
+        // re-offered it (audit 101126 §B1).
+        let root = temp_root("draft-rename-save");
+        let mut state = state();
+        state.name = "old".to_string();
+        state.queue_draft_write();
+        state.name = "new".to_string();
+        state.paint(1, 1);
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| false,
+            |sprite, kind, name| crate::drawn::save_to(&root, sprite, kind, name),
+        );
+        let actions = state.take_draft_actions();
+        let deletes_old = actions.iter().any(
+            |action| matches!(action, DraftAction::Delete { name, .. } if name.as_str() == "old"),
+        );
+        assert!(deletes_old, "the pre-rename draft must go with the save");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sprite_draft_with_surplus_frames_is_truncated() {
+        // Truncation used to be a balloon/grass-only mend: a sprite draft
+        // with more frames than it wanted reloaded inconsistent and was
+        // saved back with the surplus (audit 101126 §B3).
+        let mut state = state();
+        state.set_frames(2);
+        state.paint(2, 2);
+        let mut doc = state.draft_doc();
+        let frame = crate::drawn::frame_doc(&state.canvas);
+        doc.frames = vec![frame.clone(), frame.clone(), frame.clone(), frame];
+        doc.frames_wanted = 2;
+        state.load_draft(&doc);
+        assert_eq!(state.frames_wanted, 2);
+        assert_eq!(state.frames.len(), 2, "the surplus frames are dropped");
+    }
+
+    #[test]
+    fn set_frames_marks_the_draft_dirty() {
+        // The count and the finished frames are draft-relevant content:
+        // a drop must reach the autosave now, not with the next stroke —
+        // the stale draft resurrected the dropped frames on reload
+        // (audit 101126 §B4).
+        let mut state = state();
+        state.set_frames(2);
+        state.paint(4, 5);
+        state.primary_action_with(Instant::now(), |_, _| false, |_, _, _| Err(failed()));
+        state.set_frames(1);
+        // `set_frames` marks dirty with the state's own clock, so the
+        // probe is taken after the mark.
+        let probe = Instant::now() + Duration::from_millis(1000);
+        assert!(
+            state.draft_is_due(probe),
+            "the frame drop must reach the autosave"
+        );
+        assert_eq!(state.frames.len(), 1);
+    }
+
+    #[test]
+    fn the_frame_split_marks_the_draft_dirty() {
+        let mut state = state();
+        state.set_frames(2);
+        state.paint(3, 3);
+        let now = Instant::now();
+        state.primary_action_with(now, |_, _| false, |_, _, _| Err(failed()));
+        assert!(
+            state.draft_is_due(now + Duration::from_millis(1000)),
+            "the frame split must reach the autosave"
+        );
+    }
+
+    #[test]
+    fn a_second_end_stroke_is_a_no_op() {
+        // The pointer-up can be lost (a focus change, a capture grab); a
+        // second close must not turn two gestures into one undo step
+        // (audit 101126 §C1).
+        let mut state = state();
+        state.begin_stroke();
+        state.paint(1, 1);
+        state.end_stroke();
+        state.end_stroke();
+        assert!(!state.stroke_is_open());
+        assert!(state.undo(), "the first flush put the stroke on the stack");
+        assert!(!state.undo(), "and only one stroke landed");
+        let now = Instant::now();
+        assert!(
+            state.draft_is_due(now + Duration::from_millis(1000)),
+            "the flush marked the draft dirty"
+        );
+    }
+
+    #[test]
+    fn undo_closes_an_open_stroke_first() {
+        // A stroke still open when undo is asked for belongs to that
+        // undo: its wet cells go onto the stack instead of staying on
+        // the canvas un-undoable (audit 101126 §C1).
+        let mut state = state();
+        state.begin_stroke();
+        state.paint(2, 2);
+        let ink = state.canvas.get(2, 2);
+        assert!(ink.is_some_and(|(ch, _)| ch != ' '), "the paint wet ink");
+        assert!(state.undo(), "the wet ink is what undo removes");
+        assert!(!state.stroke_is_open(), "the stroke closed with the undo");
+        assert!(
+            state.canvas.get(2, 2).is_none_or(|(ch, _)| ch == ' '),
+            "the wet ink is gone"
+        );
+        assert!(state.redo(), "the wet stroke can come back");
+        assert_eq!(state.canvas.get(2, 2), ink);
+    }
+
+    #[test]
+    fn loading_a_draft_drops_the_open_stroke() {
+        // The draft replaces the canvas wholesale, so the open stroke's
+        // deltas describe a canvas that no longer exists: they die with
+        // the old one, and no half-stroke survives the load (audit
+        // 101126 §C1).
+        let mut state = state();
+        state.begin_stroke();
+        state.paint(1, 1);
+        let doc = state.draft_doc();
+        state.load_draft(&doc);
+        assert!(!state.stroke_is_open());
+        assert!(
+            !state.undo(),
+            "the old strokes do not describe the new canvas"
+        );
+    }
+
+    #[test]
     fn the_draft_survives_a_restart() {
         let root = temp_root("draft-restart");
         let mut state = state();
@@ -10241,7 +10471,11 @@ mod tests {
         other.apply_track_outcome(&outcome, Instant::now());
         assert_eq!(other.track.len(), 2, "the strip holds the loaded notes");
         assert_eq!(other.track_name, "march");
-        assert!(other.track_saved, "the strip holds what the file holds");
+        assert_eq!(
+            other.track_sync,
+            TrackSync::Synced,
+            "the strip holds what the file holds"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -10418,7 +10652,11 @@ mod tests {
         };
         state.apply_track_outcome(&outcome, Instant::now());
         assert_eq!(state.track.len(), 1, "the notes are still there");
-        assert!(!state.track_saved, "the strip does not claim to be saved");
+        assert_eq!(
+            state.track_sync,
+            TrackSync::Dirty,
+            "the strip does not claim to be saved"
+        );
         let toast = state.active_toast().expect("a toast");
         assert_eq!(toast, "SAVE FAILED: disk on fire");
     }
@@ -10445,6 +10683,45 @@ mod tests {
         // Editing again makes it unsaved once more.
         state.place_note(5);
         assert!(state.track_unsaved());
+    }
+
+    #[test]
+    fn the_track_sync_machine_moves_fresh_dirty_synced() {
+        // The declared machine (audit 101126 §C3): the strip starts
+        // Fresh, editing makes it Dirty, a save or a load makes it
+        // Synced, and another edit makes it Dirty again. A failed write
+        // leaves the machine where it was.
+        let mut state = default_strip_state();
+        assert_eq!(state.track_sync, TrackSync::Fresh);
+        state.place_note(1);
+        assert_eq!(state.track_sync, TrackSync::Dirty);
+        assert!(state.track_unsaved(), "dirty notes are unsaved work");
+        state.apply_track_outcome(
+            &TrackOutcome::Saved {
+                name: "march".to_string(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.track_sync, TrackSync::Synced);
+        state.place_note(2);
+        assert_eq!(state.track_sync, TrackSync::Dirty);
+        state.apply_track_outcome(
+            &TrackOutcome::Loaded {
+                name: "march".to_string(),
+                track: crate::audio::Track::new(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.track_sync, TrackSync::Synced);
+        state.place_note(3);
+        state.apply_track_outcome(
+            &TrackOutcome::Failed {
+                action: "SAVE",
+                reason: "disk on fire".to_string(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.track_sync, TrackSync::Dirty);
     }
 
     #[test]

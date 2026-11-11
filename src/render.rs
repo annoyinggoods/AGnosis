@@ -49,6 +49,26 @@ pub(crate) enum GpuPoll {
     Gone,
 }
 
+/// The GPU life-cycle of one window (audit 101126 §S3): the device
+/// thread's answer is awaited, the renderer is live, or the window is
+/// degraded — announced once, honestly. One field instead of three
+/// (`gpu_rx` + `gpu_dead` + `renderer`) makes the impossible combination
+/// (a renderer beside a pending init, a dead window that re-announces)
+/// unrepresentable. One definition, three windows: the popup, the
+/// editor and HELP cannot drift apart.
+pub(crate) enum Gpu {
+    /// The device thread has not answered yet.
+    Awaiting(std::sync::mpsc::Receiver<GpuInit>),
+    /// The renderer is live; the window draws through it. Boxed: the
+    /// renderer dwarfs the receiver, and the draw path dereferences it
+    /// once per frame.
+    Ready(Box<Renderer>),
+    /// Init failed or the renderer could not be built: the window keeps
+    /// running degraded (the parade advances its scene; HELP and the
+    /// editor say so in their title).
+    Dead,
+}
+
 /// One non-blocking poll of the GPU init channel (audit §poll_gpu): the arms
 /// report the outcome and `poll_gpu` decides, so neither nests.
 pub(crate) fn try_recv_init(rx: Option<&std::sync::mpsc::Receiver<GpuInit>>) -> GpuPoll {

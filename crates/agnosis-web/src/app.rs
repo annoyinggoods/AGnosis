@@ -120,6 +120,56 @@ pub struct Sim {
     pub assets: AssetStore,
 }
 
+/// The backend-swap machine (audit 101126 §W1): what the page asked for
+/// while it is not live yet. The transitions are reduced by
+/// [`reduce_swap`], which the host tests pin — the futures themselves
+/// only run in the browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Swap {
+    /// Nothing is in flight.
+    Idle,
+    /// A swap to that backend is requested and running.
+    InFlight(Backend),
+}
+
+/// One event of the swap machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapEvent {
+    /// The page asked for that backend.
+    Requested(Backend),
+    /// The running swap built its renderer and went live.
+    Committed,
+    /// The running swap failed; the automatic choice took over (or
+    /// failed too).
+    FellBack,
+}
+
+/// Reduce the swap machine (audit 101126 §W1): a request while one is
+/// in flight **replaces** the target, and exactly one terminal event
+/// per swap returns to Idle. A terminal event belonging to a replaced
+/// swap is a late arrival — [`settle_swap`]'s generation check keeps it
+/// away from this function.
+fn reduce_swap(swap: Swap, event: SwapEvent) -> Swap {
+    match (swap, event) {
+        (_, SwapEvent::Requested(backend)) => Swap::InFlight(backend),
+        (Swap::InFlight(_), SwapEvent::Committed) => Swap::Idle,
+        (Swap::InFlight(_), SwapEvent::FellBack) => Swap::Idle,
+        (Swap::Idle, _) => Swap::Idle,
+    }
+}
+
+/// Apply a terminal swap event if the swap that produced it is still
+/// the live one (`swap_generation == generation`): a replaced request's
+/// late arrival is ignored. Pure, so the host tests pin the whole
+/// machine even though the futures only run in the browser (audit
+/// 101126 §W1).
+fn settle_swap(swap: Swap, swap_generation: u64, generation: u64, event: SwapEvent) -> Swap {
+    if swap_generation != generation {
+        return swap;
+    }
+    reduce_swap(swap, event)
+}
+
 /// The whole live app: the simulation, the renderer and the page's state.
 pub struct AppState {
     /// The simulation.
@@ -139,8 +189,12 @@ pub struct AppState {
     /// spent in whole frames: the simulation's step is the cap's
     /// interval, not the display's.
     pub accumulator: f32,
-    /// The back end the page asked for and that is not live yet.
-    pub pending_backend: Option<Backend>,
+    /// The backend-swap machine: what was asked for and is not live yet
+    /// ([`Swap`]).
+    pub swap: Swap,
+    /// Bumped on every accepted request, so a replaced swap's late
+    /// commit cannot clear the newer one (audit 101126 §W1).
+    pub swap_generation: u64,
     /// A note for the status line (a back end that was not available, a
     /// repair the config made).
     pub note: Option<String>,
@@ -277,7 +331,8 @@ fn new_state(
         paused: false,
         last_ts_ms: None,
         accumulator: 0.0,
-        pending_backend: None,
+        swap: Swap::Idle,
+        swap_generation: 0,
         note: None,
     })
 }
@@ -564,30 +619,39 @@ pub fn parse_backend(name: &str) -> Option<Backend> {
 /// 2026-10-21 §W1).
 pub fn request_backend(backend: Backend) {
     PENDING_BACKEND.with(|cell| *cell.borrow_mut() = Some(backend));
-    if with_app(|state| {
-        state.pending_backend = Some(backend);
-    })
-    .is_none()
-    {
+    let Some(app) = the_app() else {
         // The app is not up yet: `boot` applies the request when it is.
         return;
-    }
+    };
+    // The machine takes the request and stamps the swap with a fresh
+    // generation, so the future it spawns can prove the swap is still
+    // the live one when it settles (audit 101126 §W1).
+    let generation = {
+        let mut state = app.borrow_mut();
+        state.swap = reduce_swap(state.swap, SwapEvent::Requested(backend));
+        state.swap_generation += 1;
+        state.swap_generation
+    };
     wasm_bindgen_futures::spawn_local(async move {
-        swap_the_backend(backend).await;
+        swap_the_backend(backend, generation).await;
     });
 }
 
 /// Build the back end and put it live.
-async fn swap_the_backend(backend: Backend) {
+async fn swap_the_backend(backend: Backend, generation: u64) {
     match build_and_swap(backend).await {
-        Ok(()) => forget_the_pending_backend(),
-        Err(e) => fall_back_after_failure(backend, e).await,
+        Ok(()) => {
+            with_app(|state| {
+                state.swap = settle_swap(
+                    state.swap,
+                    state.swap_generation,
+                    generation,
+                    SwapEvent::Committed,
+                );
+            });
+        }
+        Err(e) => fall_back_after_failure(backend, generation, e).await,
     }
-}
-
-/// The request has been carried out: it is not pending any more.
-fn forget_the_pending_backend() {
-    PENDING_BACKEND.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// Build a renderer on a **fresh** canvas and put it live.
@@ -617,7 +681,6 @@ async fn build_and_swap(backend: Backend) -> Result<(), String> {
     with_app(|state| {
         state.canvas = canvas.clone();
         state.renderer = Some(renderer);
-        state.pending_backend = None;
         state.note = None;
     });
     Ok(())
@@ -660,19 +723,28 @@ fn put_the_canvas_in_the_page(
 /// A forced back end that is not available falls back to the automatic
 /// choice: the parade keeps running and the status line says what
 /// happened.
-async fn fall_back_after_failure(backend: Backend, error: String) {
+async fn fall_back_after_failure(backend: Backend, generation: u64, error: String) {
     let note = format!("{} unavailable ({error})", backend_label(backend));
     match build_and_swap(Backend::Auto).await {
         Ok(()) => {
-            forget_the_pending_backend();
             with_app(|state| {
+                state.swap = settle_swap(
+                    state.swap,
+                    state.swap_generation,
+                    generation,
+                    SwapEvent::FellBack,
+                );
                 state.note = Some(note);
             });
         }
         Err(e) => {
-            forget_the_pending_backend();
             with_app(|state| {
-                state.pending_backend = None;
+                state.swap = settle_swap(
+                    state.swap,
+                    state.swap_generation,
+                    generation,
+                    SwapEvent::FellBack,
+                );
                 state.note = Some(format!("{note}; auto failed too ({e})"));
             });
         }
@@ -696,8 +768,8 @@ pub fn status_line(state: &AppState) -> String {
     // The back end that is on its way in: the page must say that a
     // switch is in flight, or it shows the **old** back end with no
     // sign of the switch (audit 2026-10-21 §W1).
-    if let Some(pending) = state.pending_backend {
-        line.push_str(&format!(" | switching to {}", backend_label(pending)));
+    if let Swap::InFlight(backend) = state.swap {
+        line.push_str(&format!(" | switching to {}", backend_label(backend)));
     }
     if let Some(note) = &state.note {
         line.push_str(" | ");
@@ -789,5 +861,46 @@ mod tests {
         assert_eq!(backend_label(Backend::WebGpu), "webgpu");
         assert_eq!(backend_label(Backend::WebGl2), "webgl2");
         assert_eq!(backend_label(Backend::Canvas2d), "canvas2d");
+    }
+
+    /// The swap machine (audit 101126 §W1): a request arms it, a
+    /// request while one is in flight **replaces** the target, and
+    /// exactly one terminal event per swap returns to Idle.
+    #[test]
+    fn the_swap_machine_replaces_and_settles() {
+        let mut swap = Swap::Idle;
+        swap = reduce_swap(swap, SwapEvent::Requested(Backend::WebGpu));
+        assert_eq!(swap, Swap::InFlight(Backend::WebGpu));
+        swap = reduce_swap(swap, SwapEvent::Requested(Backend::Canvas2d));
+        assert_eq!(swap, Swap::InFlight(Backend::Canvas2d));
+        swap = reduce_swap(swap, SwapEvent::Committed);
+        assert_eq!(swap, Swap::Idle);
+        // The failure path settles once, too.
+        swap = reduce_swap(swap, SwapEvent::Requested(Backend::WebGl2));
+        swap = reduce_swap(swap, SwapEvent::FellBack);
+        assert_eq!(swap, Swap::Idle);
+        // A terminal event for nothing is a no-op.
+        assert_eq!(reduce_swap(Swap::Idle, SwapEvent::Committed), Swap::Idle);
+    }
+
+    /// The generation check (audit 101126 §W1): a replaced swap's late
+    /// arrival is ignored; the live generation's is applied.
+    #[test]
+    fn a_late_arrival_from_a_replaced_swap_is_ignored() {
+        let in_flight = Swap::InFlight(Backend::WebGpu);
+        // A stale generation changes nothing.
+        assert_eq!(
+            settle_swap(in_flight, 7, 1, SwapEvent::Committed),
+            in_flight
+        );
+        // The live generation settles exactly once.
+        assert_eq!(
+            settle_swap(in_flight, 7, 7, SwapEvent::FellBack),
+            Swap::Idle
+        );
+        assert_eq!(
+            settle_swap(Swap::Idle, 7, 7, SwapEvent::FellBack),
+            Swap::Idle
+        );
     }
 }

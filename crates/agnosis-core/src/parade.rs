@@ -6,10 +6,11 @@
 //! (~1145 cols of ducks on a 960-col grid), so the old seamless
 //! `cols / 11` slot loop is replaced by a fixed train layout with
 //! width-driven spacing (audit sketch: big ducks 170 apart, smalls 90).
-//! The whole train shares one head phase `x0` that sweeps left; ducks keep
-//! their train offset. When the tail fully exits the left edge the head
-//! re-enters at the right edge — no duck ever wraps while partially on
-//! screen (drawing clips, see `WalkSprite::draw` and `draw_rope`).
+//! The whole train shares one head coordinate that sweeps left; ducks keep
+//! their train offset. When the **tail — its lags included** — fully exits
+//! the left edge, the head re-enters at the right edge: the train walks in
+//! as one block, and no duck ever wraps while partially on screen
+//! (drawing clips, see `WalkSprite::draw` and `draw_rope`).
 //!
 //! Slot order: slot 0 (big duck 1) heads the train at the smallest x; slot
 //! 1 (big duck 2) follows, then slots 2..=10 (smalls) trail right:
@@ -48,6 +49,13 @@
 //! ever closing the gap. When the hold ends the lag shrinks back to zero
 //! at [`CATCHUP_FACTOR`] times the march speed, so the train re-forms in
 //! about a second.
+//!
+//! The lag and the re-entry are one design (user decision 2026-11-10,
+//! audit 101126 §11): the re-entry boundary is the tail **with its lag**,
+//! so a spam-clicked hold can stretch the cycle but never break it — the
+//! held group is simply the last ducks to walk out, and the head waits
+//! for them. A clock-derived head with a fixed fold point would teleport
+//! on-screen laggards a full cycle instead.
 //!
 //! The **whole-parade stop** (the lightning) is a different primitive: it
 //! freezes the head's *translation* only. The raw clock keeps running, so
@@ -195,15 +203,26 @@ pub struct Parade {
     /// of the ducks themselves — measured, **-8.4 s after one hour**,
     /// about 405 cells on a 960-column screen (audit 2026-10-21 §F5).
     time: f64,
-    /// The clock the **translation** is driven from. It stops while the
-    /// whole parade is stopped (the lightning), so the head freezes while
-    /// `time` keeps running.
+    /// The clock the **translation** is measured on. It stops while the
+    /// whole parade is stopped, and the parallax layers read it to learn
+    /// the parade's travel; the head itself is the [`Parade::head`] state
+    /// below, not a product of this clock.
     ///
     /// `f64` for the same reason as [`Parade::time`].
     march_time: f64,
-    /// Head (slot 0) position; sweeps from `cols` down to `-train_len`,
-    /// then re-enters at `cols`.
-    x0: f32,
+    /// Head (slot 0) coordinate — **explicit state**, not a clock
+    /// product. It sweeps from `cols` down to the re-entry boundary
+    /// ([`Parade::boundary`]) and re-enters at `cols`.
+    ///
+    /// WHY state and not `x0 − speed · march_time` folded with
+    /// `rem_euclid`: a clock-derived head folds at a **fixed** period,
+    /// but the re-entry boundary moves with the holds' lag — a fixed
+    /// fold could land while the laggards are still on screen and
+    /// teleport them a full cycle (user decision 2026-11-10, audit
+    /// 101126 §11). The §F5 f64-drift protection is not needed here: the
+    /// head is bounded (`[boundary, cols]`), so `f32` keeps ~1e-4 cells
+    /// of precision forever.
+    head: f32,
     /// How far each slot is behind its nominal train position, in cells
     /// (roadmap §5.4). The invariant `lag[slot] >= lag[slot - 1]` keeps
     /// the order and the minimum gap.
@@ -232,7 +251,7 @@ impl Parade {
             loop_seconds,
             time: 0.0,
             march_time: 0.0,
-            x0: Self::head_start(cols),
+            head: Self::head_start(cols),
             lag: [0.0; DUCK_COUNT],
             held: None,
             stopped: false,
@@ -296,18 +315,17 @@ impl Parade {
     /// Advance simulation time; ducks move left at the stride-locked
     /// [`Parade::speed`] cells/s.
     ///
-    /// The positions are **not** chunking-invariant in the sense the old
-    /// comment claimed: the head follows the accumulated clock, so a
-    /// clock that drifts moves the ducks. The clock is accumulated in
-    /// `f64` so that it does **not** drift — the fixed step (1/120 s) is
-    /// not representable in binary, and an `f32` accumulator lost 8.4 s
-    /// over an hour (audit 2026-10-21 §F5).
+    /// The clocks are accumulated in `f64` so that they do **not** drift
+    /// — the fixed step (1/120 s) is not representable in binary, and an
+    /// `f32` accumulator lost 8.4 s over an hour (audit 2026-10-21 §F5).
+    /// The head itself is bounded state ([`Parade::head`]), so it cannot
+    /// drift at all.
     ///
     /// The raw clock always advances; the **march** clock (the one the
-    /// head's position follows) advances only while the parade is not
-    /// stopped, so a whole-parade stop freezes the translation and nothing
-    /// else (roadmap §5.4 rule 5). Non-finite and **non-positive** steps
-    /// are both ignored (the scene's own `advance` guard mirrors this one,
+    /// parallax reads) advances only while the parade is not stopped, so
+    /// a whole-parade stop freezes the translation and nothing else
+    /// (roadmap §5.4 rule 5). Non-finite and **non-positive** steps are
+    /// both ignored (the scene's own `advance` guard mirrors this one,
     /// audit 2026-10-23 F-035): a negative delta would run the parade
     /// backwards through its clock.
     pub fn advance(&mut self, dt_seconds: f32) {
@@ -320,6 +338,7 @@ impl Parade {
         }
         self.march_time += dt_seconds as f64;
         self.update_lags(dt_seconds);
+        self.march_the_head(self.speed() * dt_seconds);
     }
 
     /// Hold a duck in place: it stops, and every duck behind it stops too.
@@ -413,6 +432,44 @@ impl Parade {
         self.propagate_lag(0);
     }
 
+    /// The re-entry boundary: the head coordinate at which the **tail
+    /// duck** — its lag included — has fully walked out on the left.
+    ///
+    /// The lag is monotone along the train (`lag[slot] >= lag[slot - 1]`),
+    /// so the last duck's lag is the deepest and this one number covers
+    /// the whole train: `head - boundary` is exactly the tail's right
+    /// edge, and when the head reaches the boundary every duck is
+    /// off-screen left. The re-entry jump is invisible by construction —
+    /// the train walks out as one block and walks back in as one block,
+    /// however far a spam-clicked hold has stretched it (user decision
+    /// 2026-11-10, audit 101126 §11).
+    fn boundary(&self) -> f32 {
+        -(self.train_len() + self.lag[DUCK_COUNT - 1])
+    }
+
+    /// The length of one crossing cycle: the nominal sweep plus whatever
+    /// the laggards added. Always positive (`cols >= 1`, `train_len > 0`,
+    /// lags are non-negative).
+    fn cycle_len(&self) -> f32 {
+        self.cols as f32 + self.train_len() + self.lag[DUCK_COUNT - 1]
+    }
+
+    /// March the head one step and re-enter when the whole train — the
+    /// laggards included — has walked out.
+    ///
+    /// The re-entry lands the head at `cols` minus the overshoot, so the
+    /// walk-in continues exactly where the walk-out left off; the loop
+    /// covers a step long enough to cross more than one cycle. The
+    /// boundary cannot move past the head while the tail is still on
+    /// screen: `head - boundary` *is* the tail's right edge, so the
+    /// condition fires only when that edge has reached zero.
+    fn march_the_head(&mut self, step: f32) {
+        self.head -= step;
+        while self.head < self.boundary() {
+            self.head = self.cols as f32 + (self.head - self.boundary());
+        }
+    }
+
     /// Re-base the parade on a new grid width, keeping the phase.
     ///
     /// WHY: the grid carries the cell pitch, so a window resize needs a
@@ -421,19 +478,10 @@ impl Parade {
     /// is the main content of the window and the user only resized it.
     ///
     /// "Phase" here is the head's fraction through the current crossing
-    /// cycle, `frac = (head_x + train_len) / period` in `[0, 1)`. Holding
+    /// cycle, `frac = (head - boundary) / cycle_len` in `[0, 1)`. Holding
     /// that fraction fixed keeps the head at the same point of its sweep
     /// in the NEW cycle, so the train keeps marching instead of jumping
     /// back to the start.
-    ///
-    /// The algebra: with `target = frac * new_period - train_len` and
-    /// `x0 = (target + new_speed * march_time) mod new_period`, the head
-    /// lands on `target` because
-    /// `head_x = (x0 + train_len - new_speed * march_time) mod new_period -
-    /// train_len = (target + train_len) mod new_period - train_len =
-    /// target` — the `x0` term cancels the `speed * march_time` term, and
-    /// `target + train_len = frac * new_period` already lies in
-    /// `[0, new_period)`.
     ///
     /// The **lags** survive the resize unchanged: they are distances in
     /// cells, not a function of the width, and the phase survives with
@@ -443,21 +491,13 @@ impl Parade {
         if cols == self.cols {
             return;
         }
-        let train_len = self.train_len();
-        let old_period = self.period();
-        let new_period = cols as f32 + train_len;
-        // `cols >= 1` and `train_len > 0`, so both periods are positive;
-        // the guard keeps the division and the `rem_euclid` below total.
-        if old_period <= 0.0 || new_period <= 0.0 {
-            self.cols = cols;
-            self.x0 = Self::head_start(cols);
-            return;
-        }
-        let phase = self.phase_fraction();
-        let target = phase * new_period - train_len;
-        let new_speed = Self::speed_for(cols, self.loop_seconds);
-        self.x0 = rebase(target, new_speed, new_period, self.march_time);
+        // Keep the head's fraction through the current cycle: the train
+        // keeps marching instead of jumping. The boundary does not move
+        // (the offsets and the lags are width-independent), so only the
+        // cycle's width term grows.
+        let frac = self.phase_fraction();
         self.cols = cols;
+        self.head = self.boundary() + frac * self.cycle_len();
     }
 
     /// Train length in cells: last offset + small-duck width.
@@ -468,10 +508,8 @@ impl Parade {
     /// Change the crossing time, keeping the train where it is.
     ///
     /// This is the live-reload path for `loop_seconds`: the parade's speed
-    /// changes without the train jumping back to the start. The algebra
-    /// mirrors [`Parade::resize`] — the phase is kept and `x0` is
-    /// recomputed for the new speed, so the head lands exactly where it
-    /// was.
+    /// changes without the train moving at all — the head is state, so
+    /// there is nothing to re-base.
     ///
     /// A non-finite or non-positive value is refused: the old speed stays.
     pub fn set_loop_seconds(&mut self, loop_seconds: f32) {
@@ -481,17 +519,8 @@ impl Parade {
         if (loop_seconds - self.loop_seconds).abs() < f32::EPSILON {
             return;
         }
-        let train_len = self.train_len();
-        let period = self.period();
-        if period <= 0.0 {
-            self.loop_seconds = loop_seconds;
-            return;
-        }
-        let phase = self.phase_fraction();
-        let target = phase * period - train_len;
-        let new_speed = Self::speed_for(self.cols, loop_seconds);
-        self.x0 = rebase(target, new_speed, period, self.march_time);
         self.loop_seconds = loop_seconds;
+        let new_speed = Self::speed_for(self.cols, loop_seconds);
         // F-031: `loop_seconds` is the request; the stride-locked speed is
         // the actual, and the trace says how far the quantum moved it.
         let actual_loop = self.cols as f32 / new_speed;
@@ -523,41 +552,24 @@ impl Parade {
         strides * SPEED_QUANTUM
     }
 
-    /// Re-entry period: the head sweeps `cols + train_len` cells from the
-    /// right entry point to full left exit, then restarts at `cols`.
-    fn period(&self) -> f32 {
-        self.cols as f32 + self.train_len()
-    }
-
-    /// Head position at the current time: analytic sweep from the initial
-    /// phase with re-entry at the right edge once the tail has fully exited
-    /// left.
+    /// Head position at the current time: explicit state, marched and
+    /// re-entered by [`Parade::advance`] ([`Parade::head`]).
     ///
-    /// The head follows the **march** clock, not the raw clock, so a
-    /// whole-parade stop freezes the translation while the rhythm keeps
-    /// running (roadmap §5.4 rule 5).
+    /// The head freezes while the whole parade is stopped because
+    /// [`Parade::advance`] returns before marching it (roadmap §5.4
+    /// rule 5).
     fn head_x(&self) -> f32 {
-        // Bias by train_len so `x0` is the head's t=0 position; the sweep
-        // [0, period) maps to [-train_len, cols), jumping from "fully
-        // exited left" back to "entering at the right edge".
-        //
-        // WHY `f64` here: the swept distance `speed * march_time` grows
-        // without bound, so subtracting it from the (small) anchor in
-        // `f32` would lose the very digits that place the duck (audit
-        // 2026-10-21 §F5).
-        let train_len = self.train_len() as f64;
-        let raw = self.x0 as f64 + train_len - self.speed() as f64 * self.march_time;
-        (raw.rem_euclid(self.period() as f64) - train_len) as f32
+        self.head
     }
 
     /// The head's fraction through the current crossing cycle, in
-    /// `[0, 1)`: `0` is the head fully off-screen left (about to re-enter
-    /// at the right edge), `1` is the head entering at the right edge.
+    /// `[0, 1)`: `0` is the head at the re-entry boundary (the tail has
+    /// just walked out), `1` is the head entering at the right edge.
     ///
     /// The phase is width-independent, so it is the quantity a resize has
     /// to preserve (see [`Parade::resize`]).
     fn phase_fraction(&self) -> f32 {
-        (self.head_x() + self.train_len()) / self.period()
+        (self.head - self.boundary()) / self.cycle_len()
     }
 
     /// The head's fraction through the crossing cycle (test helper).
@@ -627,22 +639,9 @@ impl Parade {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_phase(&mut self, x0: f32) {
         if x0.is_finite() {
-            self.x0 = x0;
+            self.head = x0;
         }
     }
-}
-
-/// Re-base the parade's anchor after a change of speed or of width.
-///
-/// The algebra (see [`Parade::resize`]): the head lands on `target`,
-/// because the `x0` term cancels the `speed * march_time` term.
-///
-/// WHY `f64`: the swept distance grows without bound, so the sum is
-/// computed in double precision and only the **anchor** is narrowed back
-/// to `f32` (audit 2026-10-21 §F5).
-fn rebase(target: f32, new_speed: f32, period: f32, march_time: f64) -> f32 {
-    let rebased = target as f64 + new_speed as f64 * march_time;
-    rebased.rem_euclid(period as f64) as f32
 }
 
 #[cfg(test)]
@@ -927,10 +926,14 @@ mod tests {
     fn resize_to_the_same_width_is_a_no_op() {
         let mut p = Parade::new(TEST_COLS, TEST_LOOP_SECONDS);
         p.advance(2.0);
-        let x0 = p.x0;
+        let head = p.unwrapped_x(0);
         let phase = p.phase();
         p.resize(TEST_COLS);
-        assert_eq!(p.x0, x0, "a same-width resize must not touch the phase");
+        assert_eq!(
+            p.unwrapped_x(0),
+            head,
+            "a same-width resize must not move the train"
+        );
         assert_eq!(p.phase(), phase);
         assert_eq!(p.cols(), TEST_COLS);
     }
@@ -1028,6 +1031,87 @@ mod tests {
         }
     }
 
+    /// Every duck's position, front to back.
+    fn positions(p: &Parade) -> Vec<f32> {
+        (0..DUCK_COUNT).map(|slot| p.unwrapped_x(slot)).collect()
+    }
+
+    /// True when any duck's position grew since the last step — the train
+    /// re-entered.
+    fn jumped_up(before: &[f32], after: &[f32]) -> bool {
+        (0..DUCK_COUNT).any(|slot| after[slot] > before[slot] + HOLD_EPS)
+    }
+
+    /// True when no duck was on screen beyond the step margin: every art
+    /// run is fully left of the grid (within `margin` of having walked
+    /// out — the wrap is decided per step, and a duck that close to the
+    /// edge finishes exiting inside the very step the wrap fires, so it
+    /// is never *rendered* on the far side) or fully right of it.
+    fn nothing_on_screen(before: &[f32], cols: usize, margin: f32) -> bool {
+        (0..DUCK_COUNT).all(|slot| {
+            let right = before[slot] + slot_width(slot) as f32;
+            right <= margin || before[slot] >= cols as f32
+        })
+    }
+
+    #[test]
+    fn the_train_re_enters_only_after_its_laggards_walk_out() {
+        // The user's rule (2026-11-10, audit 101126 §11): the head walks
+        // in only after the last duck — the laggards a hold created
+        // included — has walked out. A spam-clicked hold must never
+        // teleport a visible duck: a re-entry may happen only while
+        // every duck is off screen (a duck within one step of the exit
+        // finishes exiting inside the same step).
+        let mut p = Parade::new(TEST_COLS, TEST_LOOP_SECONDS);
+        p.advance(1.0);
+        let mut before = positions(&p);
+        // 100 s of spam: hold five frames out of six, like a fast
+        // clicking user — the lag grows on net and stretches the cycle.
+        for frame in 0..6000 {
+            if frame % 6 != 5 {
+                p.hold(5);
+            } else {
+                p.release();
+            }
+            p.advance(1.0 / 60.0);
+            let after = positions(&p);
+            if jumped_up(&before, &after) {
+                // The tail walks out at up to (1 + CATCHUP) x speed when
+                // the group is recovering.
+                let margin = (1.0 + CATCHUP_FACTOR) * p.speed() / 60.0;
+                assert!(
+                    nothing_on_screen(&before, TEST_COLS, margin),
+                    "the train re-entered under a visible duck: before {before:?} frame {frame}"
+                );
+            }
+            assert_the_train_order(&p);
+            before = after;
+        }
+    }
+
+    #[test]
+    fn a_hold_waits_out_the_re_entry_instead_of_teleporting() {
+        // A hold that outlives one nominal cycle must not span a re-entry
+        // at all: the head waits until the held group has walked out, so
+        // nothing moves right by even a cell while the user holds
+        // (supersedes the documented +period jump of audit 101126 §C7).
+        let mut p = Parade::new(TEST_COLS, TEST_LOOP_SECONDS);
+        p.advance(1.0);
+        p.hold(5);
+        let mut before = positions(&p);
+        for _ in 0..((TEST_LOOP_SECONDS * 60.0) as usize + 120) {
+            p.advance(1.0 / 60.0);
+            let after = positions(&p);
+            assert!(
+                !jumped_up(&before, &after),
+                "the held group must not jump, whatever the cycle does"
+            );
+            assert_the_train_order(&p);
+            before = after;
+        }
+        assert!(p.is_holding(), "the hold outlived one nominal cycle");
+    }
+
     #[test]
     fn the_held_ducks_keep_walking_in_place() {
         // The gait lives in the scene and is driven by the scene's clock,
@@ -1067,6 +1151,22 @@ mod tests {
                 p.lag(slot)
             );
         }
+    }
+
+    #[test]
+    fn a_hold_that_spans_the_re_entry_wrap_keeps_the_order() {
+        // The re-entry wrap is a discontinuity in the head's x, and a
+        // hold that outlives one loop has no state for it (audit 101126
+        // §C7 — latent, documented). Whatever the wrap does to the
+        // absolute positions, the order and the gaps must survive it.
+        let mut p = Parade::new(TEST_COLS, TEST_LOOP_SECONDS);
+        p.hold(5);
+        let steps = (TEST_LOOP_SECONDS * 60.0) as usize + 120;
+        for _ in 0..steps {
+            p.advance(1.0 / 60.0);
+            assert_the_train_order(&p);
+        }
+        assert!(p.is_holding(), "the hold outlived one full loop");
     }
 
     #[test]

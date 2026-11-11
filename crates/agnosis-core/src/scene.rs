@@ -997,6 +997,20 @@ impl Scene {
         self.parade.phase()
     }
 
+    /// The parallax accumulator in cells (test helper) — the exact f64
+    /// the scroll math maintains (audit 101126 §C10).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scroll_cells(&self) -> f64 {
+        self.scroll_cells
+    }
+
+    /// The march speed in cells per second (test helper) — the same
+    /// number the scroll accumulator multiplies (audit 101126 §C10).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn march_speed(&self) -> f32 {
+        self.parade.speed()
+    }
+
     /// Insert an animal into the fixed-slot ring buffer; returns the slot
     /// written.
     pub fn push_balloon(&mut self, sprite: AsciiSprite) -> usize {
@@ -3184,6 +3198,46 @@ mod tests {
         assert!(
             (simulated - MAX_ADVANCE_SECONDS).abs() < 0.01,
             "the guard must cover {MAX_ADVANCE_SECONDS} s, got {simulated}"
+        );
+    }
+
+    #[test]
+    fn the_parallax_scroll_is_the_marched_distance_wherever_it_is_chunked() {
+        // The scroll accumulator consumes the march-clock delta exactly
+        // once per advance; a second consumer (or an update without
+        // accumulation) made the backdrops jump (audit 2026-10-21 §F5,
+        // its f32 ancestor). Chunked and single-call marching land on
+        // the same scroll within f32 chunking ulps, and the scroll
+        // continues from where it was — never resets (audit 101126
+        // §C10).
+        let cfg = crate::config::Config::default();
+        let mut one = Scene::new(&cfg, 160, 90, 12, 24);
+        let mut many = Scene::new(&cfg, 160, 90, 12, 24);
+        one.advance(2.0);
+        for _ in 0..120 {
+            many.advance(1.0 / 60.0);
+        }
+        // The march clock is a per-substep accumulator, so a chunked
+        // march can finish the substep the one-call march rounds away:
+        // the invariant is that the scroll is the marched distance
+        // within **one march substep**, whichever way the frames were
+        // chunked — never a jump, never a reset.
+        let one_substep = f64::from(many.march_speed()) * f64::from(SIM_STEP_SECONDS);
+        let single = one.scroll_cells();
+        let chunked = many.scroll_cells();
+        assert!(
+            (single - chunked).abs() <= one_substep + 1e-6,
+            "one call: {single} vs chunked {chunked}"
+        );
+        assert!(
+            (single - f64::from(many.march_speed()) * f64::from(many.elapsed())).abs()
+                <= one_substep + 1e-6,
+            "the scroll is the marched distance: {single}"
+        );
+        one.advance(1.0);
+        assert!(
+            one.scroll_cells() > single,
+            "the scroll continues from where it was"
         );
     }
 

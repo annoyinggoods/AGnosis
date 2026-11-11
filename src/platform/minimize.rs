@@ -126,6 +126,27 @@ impl Minimized {
     pub fn is_empty(&self) -> bool {
         self.hidden.is_empty()
     }
+
+    /// Merge another record into this one, keeping the windows of both.
+    ///
+    /// WHY: the daemon used to **overwrite** the record on every minimize
+    /// pass, so a pass that ran between the parade's close and the
+    /// restore permanently orphaned the first pass's windows — hidden and
+    /// never put back (audit 101126 §B5). A pass records only what it
+    /// really hid, so the union is exactly what the restore must cover.
+    pub fn merge(&mut self, other: Minimized) {
+        self.hidden.merge(other.hidden);
+    }
+
+    /// A record with `n` synthetic entries — the merge test's fixture.
+    ///
+    /// The entries are never handed to a restore; the test only counts.
+    #[cfg(test)]
+    fn synthetic(n: usize) -> Self {
+        Self {
+            hidden: imp::Hidden::synthetic(n),
+        }
+    }
 }
 
 /// Normalize one executable name for comparison: lowercase, `.exe` stripped.
@@ -422,6 +443,22 @@ mod imp {
         pub(super) fn is_empty(&self) -> bool {
             self.windows.is_empty()
         }
+
+        pub(super) fn merge(&mut self, other: Hidden) {
+            for window in other.windows {
+                if !self.windows.contains(&window) {
+                    self.windows.push(window);
+                }
+            }
+        }
+
+        /// A synthetic record of `n` entries — the merge test's fixture.
+        #[cfg(test)]
+        pub(super) fn synthetic(n: usize) -> Self {
+            Self {
+                windows: (1..=n).map(|i| 0x4000_0000 + i).collect(),
+            }
+        }
     }
 
     struct Ctx<'a> {
@@ -715,6 +752,22 @@ mod imp {
 
         pub(super) fn is_empty(&self) -> bool {
             self.windows.is_empty()
+        }
+
+        pub(super) fn merge(&mut self, other: Hidden) {
+            for window in other.windows {
+                if !self.windows.contains(&window) {
+                    self.windows.push(window);
+                }
+            }
+        }
+
+        /// A synthetic record of `n` entries — the merge test's fixture.
+        #[cfg(test)]
+        pub(super) fn synthetic(n: usize) -> Self {
+            Self {
+                windows: (1..=n as Window).collect(),
+            }
         }
     }
 
@@ -1083,6 +1136,22 @@ mod imp {
         pub(super) fn is_empty(&self) -> bool {
             self.pids.is_empty()
         }
+
+        pub(super) fn merge(&mut self, other: Hidden) {
+            for pid in other.pids {
+                if !self.pids.contains(&pid) {
+                    self.pids.push(pid);
+                }
+            }
+        }
+
+        /// A synthetic record of `n` entries — the merge test's fixture.
+        #[cfg(test)]
+        pub(super) fn synthetic(n: usize) -> Self {
+            Self {
+                pids: (1..=n as u32).collect(),
+            }
+        }
     }
 
     /// Process id of a running application.
@@ -1245,6 +1314,14 @@ mod imp {
         pub(super) fn is_empty(&self) -> bool {
             true
         }
+
+        pub(super) fn merge(&mut self, _other: Hidden) {}
+
+        /// A synthetic record of `n` entries — the merge test's fixture.
+        #[cfg(test)]
+        pub(super) fn synthetic(_n: usize) -> Self {
+            Self
+        }
     }
 
     pub(super) fn minimize_and_record(
@@ -1332,6 +1409,25 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
         restore(&empty);
+    }
+
+    /// The merge keeps the windows of **both** records: a minimize pass
+    /// that runs between the parade's close and the restore must not
+    /// orphan the previous pass's windows — hidden and never put back
+    /// (audit 101126 §B5). Identities are deduplicated, so re-merging
+    /// the same windows adds nothing.
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn merge_keeps_the_windows_of_both_records() {
+        // The fixtures share two identities, so the merge of 2 and 3
+        // windows is the 3-window union: both records' windows are in
+        // it, and nothing is doubled.
+        let mut held = Minimized::synthetic(2);
+        assert_eq!(held.len(), 2);
+        held.merge(Minimized::synthetic(3));
+        assert_eq!(held.len(), 3, "the union is what the restore must cover");
+        held.merge(Minimized::synthetic(3));
+        assert_eq!(held.len(), 3, "the same identities are not doubled");
     }
 
     /// A browser nobody has installed hides nothing, so the record stays

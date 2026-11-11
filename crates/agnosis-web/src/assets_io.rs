@@ -81,6 +81,12 @@ impl AssetStore {
         self.assets.len()
     }
 
+    /// Every asset of the store, as `(kind, name, sprite)` — the walk
+    /// the package export makes when it writes the store back out.
+    pub fn entries(&self) -> &[(DrawnKind, String, DrawnSprite)] {
+        &self.assets
+    }
+
     /// Whether the store carries no asset at all.
     ///
     /// WHY it exists: a `len() == 0` check at the call sites reads as a
@@ -164,10 +170,17 @@ fn apply(
         return Err("the parade is not running yet".to_string());
     };
     let mut state = app.borrow_mut();
+    // The assets join a **copy** of the store first: the config the
+    // manifest describes is validated against the merged store, and only
+    // a config that came out is committed. Inserting into the live store
+    // first used to leave the assets in it when the config half failed,
+    // and their names leaked into the next import (audit 101126 §B8).
+    let mut next = state.sim.assets.clone();
     for (kind, name, sprite) in assets {
-        state.sim.assets.insert(kind, name, sprite);
+        next.insert(kind, name, sprite);
     }
-    let cfg = config_of(&manifest, &state.sim.assets)?;
+    let cfg = config_of(&manifest, &next)?;
+    state.sim.assets = next;
     // The scene is **reloaded in place**: the core's injectable reload
     // path (`Scene::apply_config_with`) reads the assets through the
     // loader, so the web's in-memory store answers it. The parade keeps

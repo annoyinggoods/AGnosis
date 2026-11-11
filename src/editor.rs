@@ -443,9 +443,9 @@ pub struct EditorApp {
     settings_action: SettingsAction,
     /// The window's inner size in pixels.
     inner: (u32, u32),
-    gpu_rx: Option<std::sync::mpsc::Receiver<crate::render::GpuInit>>,
-    gpu_dead: bool,
-    renderer: Option<crate::render::Renderer>,
+    /// The GPU life-cycle ([`Gpu`]): the same machine the popup runs
+    /// (audit 101126 §S3).
+    gpu: Gpu,
     /// Grid geometry `(base_cols, base_rows, ui_cols, ui_rows)` the
     /// current grids were built for.
     geometry: (usize, usize, usize, usize),
@@ -659,7 +659,7 @@ impl EditorApp {
     fn draw_frame(&mut self) {
         let layout = layout(self.inner.0, self.inner.1, &self.state);
         self.paint_layers(&layout);
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Gpu::Ready(renderer) = &mut self.gpu else {
             return;
         };
         let Some(base_font) = self.base_font.as_mut() else {
@@ -752,23 +752,27 @@ impl EditorApp {
     /// Poll the GPU init thread; a failed or vanished init degrades to the
     /// black window instead of panicking (audit §poll_gpu).
     fn poll_gpu(&mut self) {
-        if self.renderer.is_some() || self.gpu_dead {
+        let Gpu::Awaiting(receiver) = &self.gpu else {
             return;
-        }
-        let init = match try_recv_init(self.gpu_rx.as_ref()) {
+        };
+        let init = match try_recv_init(Some(receiver)) {
             GpuPoll::Ready(init) => init,
             GpuPoll::Pending => return,
             GpuPoll::Gone => {
                 self.degraded("editor.gpu init unavailable, degraded");
-                self.gpu_rx = None;
                 return;
             }
         };
-        self.gpu_rx = None;
+        // The channel is spent: the machine moves on to Ready or Dead
+        // and never awaits the same init twice (audit 101126 §S3).
+        self.gpu = Gpu::Dead;
         agnosis_core::trace::trace("editor.device-ready");
         let window = match self.window.as_ref() {
             Some(window) => Arc::clone(window),
-            None => return,
+            None => {
+                self.degraded("editor.gpu window gone, degraded");
+                return;
+            }
         };
         let surface = match init.instance.create_surface(Arc::clone(&window)) {
             Ok(surface) => surface,
@@ -793,7 +797,7 @@ impl EditorApp {
         {
             Ok(renderer) => {
                 agnosis_core::trace::trace("editor.renderer-ready");
-                self.renderer = Some(renderer);
+                self.gpu = Gpu::Ready(Box::new(renderer));
             }
             Err(e) => self.degraded(&format!("editor.renderer error, degraded: {e}")),
         }
@@ -804,10 +808,11 @@ impl EditorApp {
     /// The degradation is **honest** (audit 2026-10-23 §F-092): the
     /// window's title says so — the OS-level escape route, the same
     /// shape the popup uses — and the status line carries the word, so a
-    /// black editor window is never mute.
+    /// black editor window is never mute. `Dead` is terminal: the
+    /// announcement fires exactly once (audit 101126 §S3).
     fn degraded(&mut self, msg: &str) {
         agnosis_core::trace::trace(msg);
-        self.gpu_dead = true;
+        self.gpu = Gpu::Dead;
         if let Some(window) = self.window.as_ref() {
             window.set_title("AGnosis - GPU UNAVAILABLE");
         }
@@ -857,7 +862,7 @@ impl EditorApp {
     fn on_resize(&mut self, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
         self.inner = (width, height);
-        if let Some(renderer) = self.renderer.as_mut() {
+        if let Gpu::Ready(renderer) = &mut self.gpu {
             renderer.resize(width, height);
         }
         self.rebuild_grids(width, height);
@@ -1809,7 +1814,7 @@ fn scroll_columns_delta(key: &Key) -> Option<i32> {
 /// The outcome and the poll live in [`crate::render`], where both
 /// windows can reach them: one definition, two callers (audit
 /// 2026-10-21 §G26).
-use crate::render::{try_recv_init, GpuPoll};
+use crate::render::{try_recv_init, Gpu, GpuPoll};
 
 /// The editor's frame interval.
 fn frame_interval() -> Duration {
@@ -2025,9 +2030,7 @@ pub fn run(cfg: &agnosis_core::config::Config, args: &EditorArgs) -> Result<(), 
         settings_writer: Box::new(write_setting),
         settings_action: Box::new(run_personality_action),
         inner: (0, 0),
-        gpu_rx: Some(gpu_rx),
-        gpu_dead: false,
-        renderer: None,
+        gpu: Gpu::Awaiting(gpu_rx),
         geometry: (0, 0, 0, 0),
         first_frame: false,
         next_frame: Instant::now(),
@@ -2094,9 +2097,7 @@ mod tests {
             settings_writer: Box::new(|_, _, _| Ok(())),
             settings_action: Box::new(|_| Ok(())),
             inner: (0, 0),
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             geometry: (0, 0, 0, 0),
             first_frame: false,
             next_frame: Instant::now(),

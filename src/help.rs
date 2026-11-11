@@ -49,7 +49,7 @@ use winit::platform::windows::WindowAttributesExtWindows;
 
 // The GPU-init poll and its outcome are shared with the popup and the
 // editor: one definition, three callers (audit 2026-10-21 §G26).
-use crate::render::{try_recv_init, GpuPoll};
+use crate::render::{try_recv_init, Gpu, GpuPoll};
 
 /// The HELP window's **pure** half — the strip, the wrap, the scroll
 /// model and the paint helpers.
@@ -146,9 +146,9 @@ pub struct HelpApp {
     /// Grid geometry `(body_cols, body_rows, footer_cols, footer_rows)`
     /// the current grids were built for.
     geometry: (usize, usize, usize, usize),
-    gpu_rx: Option<std::sync::mpsc::Receiver<crate::render::GpuInit>>,
-    gpu_dead: bool,
-    renderer: Option<crate::render::Renderer>,
+    /// The GPU life-cycle ([`Gpu`]): the same machine the popup runs
+    /// (audit 101126 §S3).
+    gpu: Gpu,
     /// True when something changed and the page needs one redraw.
     dirty: bool,
     /// True after the first successful draw: the window then sleeps
@@ -162,19 +162,23 @@ impl HelpApp {
     /// the honest dead-GPU title instead of panicking (the popup's and
     /// the editor's shape, audit 2026-10-23 §F-092).
     fn poll_gpu(&mut self) {
-        if self.renderer.is_some() || self.gpu_dead {
+        let Gpu::Awaiting(receiver) = &self.gpu else {
             return;
-        }
-        let init = match try_recv_init(self.gpu_rx.as_ref()) {
+        };
+        let init = match try_recv_init(Some(receiver)) {
             GpuPoll::Ready(init) => init,
             GpuPoll::Pending => return,
             GpuPoll::Gone => {
                 self.degrade();
-                self.gpu_rx = None;
                 return;
             }
         };
-        self.gpu_rx = None;
+        // The channel is spent: the machine moves on to Ready or Dead
+        // and never awaits the same init twice (audit 101126 §S3). A
+        // failure below leaves it in `Dead` — the footer then paints the
+        // dead-GPU word instead of the hints.
+        self.gpu = Gpu::Dead;
+        self.mark_dirty();
         agnosis_core::trace::trace("help.device-ready");
         let window = match self.window.as_ref() {
             Some(window) => Arc::clone(window),
@@ -183,9 +187,7 @@ impl HelpApp {
         let surface = match init.instance.create_surface(Arc::clone(&window)) {
             Ok(surface) => surface,
             Err(e) => {
-                self.gpu_dead = true;
                 agnosis_core::trace::trace(&format!("help.surface error, degraded: {e}"));
-                self.mark_dirty();
                 return;
             }
         };
@@ -195,9 +197,7 @@ impl HelpApp {
             match crate::render::pick_surface_config(&surface, &init.adapter, width, height) {
                 Some(config) => config,
                 None => {
-                    self.gpu_dead = true;
                     agnosis_core::trace::trace("help.surface no-compatible-format, degraded");
-                    self.mark_dirty();
                     return;
                 }
             };
@@ -205,24 +205,24 @@ impl HelpApp {
         {
             Ok(renderer) => {
                 agnosis_core::trace::trace("help.renderer-ready");
-                self.renderer = Some(renderer);
-                self.mark_dirty();
+                self.gpu = Gpu::Ready(Box::new(renderer));
             }
             Err(e) => {
-                self.gpu_dead = true;
                 agnosis_core::trace::trace(&format!("help.renderer error, degraded: {e}"));
-                self.mark_dirty();
             }
         }
+        self.mark_dirty();
     }
 
     /// The honest dead-GPU state: the title says it at the OS level.
     /// With the renderer gone there is nothing left to paint the
     /// footer's word with, so the OS title — task bar, alt-tab — is the
-    /// only surface that can carry it (audit 2026-10-23 §F-092).
+    /// only surface that can carry it (audit 2026-10-23 §F-092). `Dead`
+    /// is terminal: the announcement fires exactly once (audit 101126
+    /// §S3).
     fn degrade(&mut self) {
         agnosis_core::trace::trace("help.gpu init unavailable, degraded");
-        self.gpu_dead = true;
+        self.gpu = Gpu::Dead;
         if let Some(window) = self.window.as_ref() {
             window.set_title("AGnosis - GPU UNAVAILABLE");
         }
@@ -232,7 +232,11 @@ impl HelpApp {
     /// Draw one frame: paint the page and the footer, hand them to the
     /// renderer. A missing piece is a no-op.
     fn draw_frame(&mut self) {
-        let Some(renderer) = self.renderer.as_mut() else {
+        // The footer's choice is read **before** the renderer borrows
+        // `gpu`; with the machine the two states cannot coexist anyway —
+        // a `Ready` window is never `Dead` (audit 101126 §S3).
+        let dead = matches!(self.gpu, Gpu::Dead);
+        let Gpu::Ready(renderer) = &mut self.gpu else {
             return;
         };
         let Some(font) = self.font.as_mut() else {
@@ -249,7 +253,7 @@ impl HelpApp {
         };
         let visible = grid.rows();
         paint_body(grid, &self.state, visible);
-        if self.gpu_dead {
+        if dead {
             paint_footer_gpu_dead(overlay);
         } else {
             paint_footer(overlay, &self.state);
@@ -360,7 +364,7 @@ impl HelpApp {
     fn on_resize(&mut self, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
         self.inner = (width, height);
-        if let Some(renderer) = self.renderer.as_mut() {
+        if let Gpu::Ready(renderer) = &mut self.gpu {
             renderer.resize(width, height);
         }
         self.rebuild_grids(width, height);
@@ -567,9 +571,7 @@ fn run_window(text: &str, args: &HelpArgs) -> Result<(), HelpError> {
         overlay_font: None,
         inner: (0, 0),
         geometry: (0, 0, 0, 0),
-        gpu_rx: Some(gpu_rx),
-        gpu_dead: false,
-        renderer: None,
+        gpu: Gpu::Awaiting(gpu_rx),
         dirty: false,
         first_frame: false,
         exit: false,
@@ -614,9 +616,7 @@ mod tests {
             overlay_font: None,
             inner: (1536, 864),
             geometry: (0, 0, 0, 0),
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             dirty: false,
             first_frame: false,
             exit: false,
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn a_dead_gpu_swaps_the_footer_for_the_word() {
         let mut app = app_for_tests();
-        app.gpu_dead = true;
+        app.gpu = Gpu::Dead;
         app.rebuild_grids(1536, 864);
         app.rebuild_fonts();
         // The footer paints the dead-GPU text through the same path the

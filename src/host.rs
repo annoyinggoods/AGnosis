@@ -587,6 +587,51 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The drawn-asset name cache (audit 2026-10-21 §G18)
+    // -----------------------------------------------------------------
+
+    /// The cache's folder-mtime stamp **is** the invalidation: a file
+    /// written after the list was read must appear on the next ask, so a
+    /// freshly drawn asset reaches the editor's lister right away
+    /// (audit 101126 §S12).
+    #[test]
+    fn the_name_cache_refreshes_when_the_folder_changes() {
+        let dir = temp_root("name-cache");
+        let doc = agnosis_core::drawn::DrawnDoc {
+            kind: agnosis_core::drawn::DrawnKind::Sprite,
+            size: Some(agnosis_core::drawn::DrawnSize::Big),
+            frames: vec![agnosis_core::drawn::FrameDoc {
+                cols: 2,
+                rows: 2,
+                chars: vec!['@', ' ', '@', ' '],
+                colors: vec![[0, 0, 0]; 4],
+            }],
+            ..agnosis_core::drawn::DrawnDoc::default()
+        };
+        let body = serde_json::to_string(&doc).expect("the doc serializes");
+        let mut slot: Option<DrawnNames> = None;
+        refresh_names(&mut slot, &dir);
+        assert!(slot.as_ref().is_some_and(|entry| entry.names.is_empty()));
+        std::fs::write(dir.join("sprite-a.json"), &body).expect("write the asset");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        refresh_names(&mut slot, &dir);
+        assert_eq!(
+            slot.as_ref().map(|entry| entry.names.len()),
+            Some(1),
+            "the new file must show up on the next ask"
+        );
+        std::fs::write(dir.join("sprite-b.json"), &body).expect("write the second asset");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        refresh_names(&mut slot, &dir);
+        assert_eq!(
+            slot.as_ref().map(|entry| entry.names.len()),
+            Some(2),
+            "the second file must show up too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
     // The HELP window's README resolution (roadmap HELP_WINDOW §1)
     // -----------------------------------------------------------------
 

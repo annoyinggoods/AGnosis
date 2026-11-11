@@ -39,6 +39,21 @@ pub fn write(
     name: &str,
     _assets: &AssetDirs,
 ) -> Result<u64, ExportError> {
+    let html = render_with_manifest(recording, cfg, name);
+    std::fs::write(path, html.as_bytes()).map_err(|source| ExportError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(html.len() as u64)
+}
+
+/// The finished page for a recording of `cfg`: the manifest is the
+/// config's own, exactly as [`write`] carries it.
+///
+/// WHY the split: a host with no file system (the browser) downloads
+/// the page instead of writing it, and the manifest logic must not
+/// drift between the two callers.
+pub fn render_with_manifest(recording: &Recording, cfg: &Config, name: &str) -> String {
     let manifest = crate::manifest::Manifest::from_config(cfg, name);
     let json = match manifest.to_json() {
         Ok(json) => json,
@@ -51,12 +66,7 @@ pub fn write(
             "{}".to_string()
         }
     };
-    let html = render(recording, &json);
-    std::fs::write(path, html.as_bytes()).map_err(|source| ExportError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(html.len() as u64)
+    render(recording, &json)
 }
 
 /// The finished page: the template with its three placeholders filled in.
@@ -209,6 +219,26 @@ mod tests {
     fn the_page_carries_the_manifest() {
         let html = render(&tiny_recording(), "{\"version\":1,\"name\":\"my parade\"}");
         assert!(html.contains("my parade"), "the manifest must travel");
+    }
+
+    #[test]
+    fn the_manifest_render_carries_the_config_manifest() {
+        // The browser host builds the page through `render_with_manifest`
+        // — the same manifest logic `write` uses — so the name travels
+        // the same way.
+        let html = render_with_manifest(
+            &tiny_recording(),
+            &crate::config::Config::default(),
+            "a ducks parade",
+        );
+        assert!(
+            html.contains("a ducks parade"),
+            "the manifest's name must travel"
+        );
+        assert!(
+            !html.contains("@@AGNOSIS_"),
+            "no placeholder is left behind"
+        );
     }
 
     #[test]

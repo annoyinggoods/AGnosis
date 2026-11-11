@@ -182,6 +182,29 @@ fn overlay_probe_due(last: Instant, now: Instant) -> bool {
     now.duration_since(last) >= OVERLAY_PROBE_INTERVAL
 }
 
+/// One probe round of the overlay watch: an overlay still open keeps its
+/// slot, a closed one drops out, and the watch ends when the last slot
+/// does — the caller re-promotes then. The probe replaces the belief
+/// slot by slot, so a second overlay never resets the first. Pure, so
+/// the demote/re-promote machine is testable without a window (audit
+/// 101126 §S8).
+fn fold_overlay_watch(
+    watch: &OverlayWatch,
+    help_open: bool,
+    editor_open: bool,
+) -> Option<OverlayWatch> {
+    let help = watch.help && help_open;
+    let editor = watch.editor && editor_open;
+    if !(help || editor) {
+        return None;
+    }
+    Some(OverlayWatch {
+        help,
+        editor,
+        since: Instant::now(),
+    })
+}
+
 /// The spawned overlay window the parade steps aside for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overlay {
@@ -411,6 +434,19 @@ struct LoadResult {
 struct BalloonLoader {
     requests: std::sync::mpsc::Sender<LoadRequest>,
     results: std::sync::mpsc::Receiver<LoadResult>,
+    /// The names with a conversion still in flight. This set is the
+    /// request identity the channel alone could not carry: two Enters on
+    /// one name used to queue two conversions and push two copies of the
+    /// same balloon into the five-slot ring (audit 101126 §B6).
+    pending: std::collections::HashSet<String>,
+}
+
+/// Why a typed balloon was not queued for conversion.
+enum LoadReject {
+    /// That exact name is already converting on the worker.
+    InFlight,
+    /// The worker is gone; nothing would answer.
+    WorkerGone,
 }
 
 impl BalloonLoader {
@@ -428,25 +464,42 @@ impl BalloonLoader {
         Some(Self {
             requests: request_tx,
             results: result_rx,
+            pending: std::collections::HashSet::new(),
         })
     }
 
-    /// Ask the worker to load one balloon. False when the request could
-    /// not be queued (the worker is gone).
-    fn request(&self, dir: &std::path::Path, name: &str, rx: i64, ry: i64) -> bool {
+    /// Ask the worker to load one balloon. `Err` when the request could
+    /// not be queued: that exact conversion is already in flight, or the
+    /// worker is gone.
+    fn request(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+        rx: i64,
+        ry: i64,
+    ) -> Result<(), LoadReject> {
+        if !self.pending.insert(name.to_string()) {
+            return Err(LoadReject::InFlight);
+        }
         let request = LoadRequest {
             name: name.to_string(),
             dir: dir.to_path_buf(),
             rx,
             ry,
         };
-        self.requests.send(request).is_ok()
+        if self.requests.send(request).is_err() {
+            self.pending.remove(name);
+            return Err(LoadReject::WorkerGone);
+        }
+        Ok(())
     }
 
-    /// Take the answers that are ready. Never blocks.
-    fn drain(&self) -> Vec<LoadResult> {
+    /// Take the answers that are ready. Never blocks. An answered name
+    /// leaves the in-flight set, so the same name can be asked again.
+    fn drain(&mut self) -> Vec<LoadResult> {
         let mut out = Vec::new();
         while let Ok(result) = self.results.try_recv() {
+            self.pending.remove(&result.name);
             out.push(result);
         }
         out
@@ -532,9 +585,8 @@ struct PopupApp {
     /// blocks on a folder scan or an image decode (audit 2026-10-20
     /// §3.2).
     loader: Option<BalloonLoader>,
-    gpu_rx: Option<std::sync::mpsc::Receiver<crate::render::GpuInit>>,
-    gpu_dead: bool,
-    renderer: Option<crate::render::Renderer>,
+    /// The GPU life-cycle: see [`Gpu`].
+    gpu: Gpu,
     first_frame: bool,
     last_tick: Instant,
     next_frame: Instant,
@@ -1014,7 +1066,7 @@ impl PopupApp {
     /// GPU-less window) the frame is blitted from the scene's grid, the
     /// same headless path the selftest gate uses.
     fn shot_frame(&mut self) -> Result<agnosis_core::blit::FrameBuffer, String> {
-        if let Some(renderer) = self.renderer.as_ref() {
+        if let Gpu::Ready(renderer) = &self.gpu {
             return Ok(renderer.last_frame());
         }
         self.render_the_frame()
@@ -1145,9 +1197,8 @@ impl PopupApp {
 
     /// Blit the scene through the renderer; missing pieces are a no-op.
     fn draw_frame(&mut self) {
-        let renderer = match self.renderer.as_mut() {
-            Some(renderer) => renderer,
-            None => return,
+        let Gpu::Ready(renderer) = &mut self.gpu else {
+            return;
         };
         let font = match self.font.as_mut() {
             Some(font) => font,
@@ -1218,17 +1269,20 @@ impl PopupApp {
         self.line_dirty = true;
     }
 
-    /// Compose the input line text: the status message while fresh, the
-    /// usage hint while the buffer is empty, otherwise the prompt with the
-    /// live buffer and cursor.
+    /// Compose the input line text: the live buffer first, then the
+    /// status message while fresh, otherwise the usage hint.
+    ///
+    /// The buffer wins over fresh feedback: during "LOADING X" the
+    /// user's next typing used to be invisible, and Enter committed a
+    /// buffer they never saw (audit 101126 §B7).
     fn compose_input_line(&self) -> String {
+        if !self.input.is_empty() {
+            return format!("ADD BALLOON: {}_", self.input);
+        }
         if let Some((msg, _, _)) = &self.feedback {
             return msg.clone();
         }
-        if self.input.is_empty() {
-            return INPUT_HINT.to_string();
-        }
-        format!("ADD BALLOON: {}_", self.input)
+        INPUT_HINT.to_string()
     }
 
     /// Enter on the input line: hand the typed name to the loader and let
@@ -1249,15 +1303,17 @@ impl PopupApp {
         }
         let dir = balloon_folder();
         let (rx, ry) = self.balloon_radii;
-        let queued = match self.loader.as_mut() {
-            Some(loader) => loader.request(&dir, &name, rx, ry),
-            None => false,
-        };
-        if !queued {
+        let Some(loader) = self.loader.as_mut() else {
             self.set_feedback("THE BALLOON LOADER IS NOT RUNNING");
             return;
+        };
+        match loader.request(&dir, &name, rx, ry) {
+            Ok(()) => self.set_feedback(&format!("LOADING {}", name.to_uppercase())),
+            Err(LoadReject::InFlight) => {
+                self.set_feedback(&format!("ALREADY LOADING {}", name.to_uppercase()))
+            }
+            Err(LoadReject::WorkerGone) => self.set_feedback("THE BALLOON LOADER IS NOT RUNNING"),
         }
-        self.set_feedback(&format!("LOADING {}", name.to_uppercase()));
     }
 
     /// Drain the loader's results into the scene's ring.
@@ -1301,7 +1357,7 @@ impl PopupApp {
     /// matches the disc it is drawn on.
     fn on_resize(&mut self, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
-        if let Some(renderer) = self.renderer.as_mut() {
+        if let Gpu::Ready(renderer) = &mut self.gpu {
             renderer.resize(width, height);
         }
         let geometry = self.cfg.grid_for_monitor(width, height, self.args.scale);
@@ -1376,23 +1432,27 @@ impl PopupApp {
     /// Poll the GPU init thread; a failed or vanished init degrades to the
     /// black-window scene-advance loop instead of panicking (audit §poll_gpu).
     fn poll_gpu(&mut self) {
-        if self.renderer.is_some() || self.gpu_dead {
+        let Gpu::Awaiting(receiver) = &self.gpu else {
             return;
-        }
-        let init = match try_recv_init(self.gpu_rx.as_ref()) {
+        };
+        let init = match try_recv_init(Some(receiver)) {
             GpuPoll::Ready(init) => init,
             GpuPoll::Pending => return,
             GpuPoll::Gone => {
                 self.degraded("popup.gpu init unavailable, degraded");
-                self.gpu_rx = None;
                 return;
             }
         };
-        self.gpu_rx = None;
+        // The channel is spent: the machine moves on to Ready or Dead
+        // and never awaits the same init twice (audit 101126 §S3).
+        self.gpu = Gpu::Dead;
         agnosis_core::trace::trace("popup.device-ready");
         let window = match self.window.as_ref() {
             Some(w) => Arc::clone(w),
-            None => return,
+            None => {
+                self.degraded("popup.gpu window gone, degraded");
+                return;
+            }
         };
         let surface = match init.instance.create_surface(Arc::clone(&window)) {
             Ok(s) => s,
@@ -1420,7 +1480,7 @@ impl PopupApp {
         {
             Ok(renderer) => {
                 agnosis_core::trace::trace("popup.renderer-ready");
-                self.renderer = Some(renderer);
+                self.gpu = Gpu::Ready(Box::new(renderer));
             }
             Err(e) => self.degraded(&format!("popup.renderer error, degraded: {e}")),
         }
@@ -1435,14 +1495,14 @@ impl PopupApp {
     /// line) spells the whole story out.
     fn degraded(&mut self, msg: &str) {
         agnosis_core::trace::trace(msg);
-        let first = !self.gpu_dead;
-        self.gpu_dead = true;
+        let first = !matches!(self.gpu, Gpu::Dead);
+        self.gpu = Gpu::Dead;
         if let Some(window) = self.window.as_ref() {
             window.set_title("AGnosis - GPU UNAVAILABLE");
         }
         self.set_feedback("NO GPU - PRESS ESC TO EXIT");
         // A modal box inside a test would hang the whole suite — the
-        // tests assert on `gpu_dead`, never on the box.
+        // tests assert on the machine, never on the box.
         if first && !cfg!(test) {
             announce_gpu_failure(msg);
         }
@@ -1604,17 +1664,16 @@ impl PopupApp {
         if !overlay_probe_due(watch.since, now) {
             return;
         }
-        let watch = OverlayWatch {
-            since: now,
-            help: watch.help && crate::platform::window::help_is_open(),
-            editor: watch.editor && crate::platform::window::editor_is_open(),
-        };
-        self.overlay_watch = Some(watch);
-        if watch.help || watch.editor {
-            return;
+        // The fold is a pure function, so the demote/re-promote machine
+        // is testable without a window (audit 101126 §S8).
+        self.overlay_watch = fold_overlay_watch(
+            &watch,
+            crate::platform::window::help_is_open(),
+            crate::platform::window::editor_is_open(),
+        );
+        if self.overlay_watch.is_none() {
+            self.restore_always_on_top();
         }
-        self.overlay_watch = None;
-        self.restore_always_on_top();
     }
 
     /// `Ctrl+O` opens the balloons folder instead of typing the letter.
@@ -1743,7 +1802,7 @@ fn watcher_message(
 /// The outcome and the poll live in [`crate::render`], where both
 /// windows can reach them: one definition, two callers (audit
 /// 2026-10-21 §G26).
-use crate::render::{try_recv_init, GpuPoll};
+use crate::render::{try_recv_init, Gpu, GpuPoll};
 
 impl ApplicationHandler for PopupApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -1924,9 +1983,7 @@ pub fn run(cfg: &agnosis_core::config::Config, args: &PopupArgs) -> Result<(), P
         font: None,
         watcher: None,
         loader: BalloonLoader::start(),
-        gpu_rx: Some(gpu_rx),
-        gpu_dead: false,
-        renderer: None,
+        gpu: Gpu::Awaiting(gpu_rx),
         first_frame: false,
         last_tick: now,
         next_frame: now,
@@ -2012,6 +2069,35 @@ mod tests {
         assert!(overlay_probe_due(now - OVERLAY_PROBE_INTERVAL, now));
         // Well past it: still just "due", never a panic or a wrap.
         assert!(overlay_probe_due(now - OVERLAY_PROBE_INTERVAL * 100, now));
+    }
+
+    #[test]
+    fn the_overlay_watch_folds_one_probe_round() {
+        let watch = OverlayWatch {
+            help: true,
+            editor: false,
+            since: Instant::now(),
+        };
+        // A still-open reader keeps its slot.
+        let kept = fold_overlay_watch(&watch, true, false).expect("still watching");
+        assert!(kept.help && !kept.editor);
+        // The probe never **adds** a slot: the watch holds only the
+        // overlays the parade demoted for (audit 101126 §S8).
+        let kept_too = fold_overlay_watch(&watch, true, true).expect("still watching");
+        assert!(kept_too.help && !kept_too.editor);
+        // The only watched reader closed: the watch ends, the caller
+        // re-promotes.
+        assert!(fold_overlay_watch(&watch, false, false).is_none());
+        // Two watched overlays: a closed one drops out of its slot
+        // alone, and the last close ends the watch.
+        let both = OverlayWatch {
+            help: true,
+            editor: true,
+            since: Instant::now(),
+        };
+        let alone = fold_overlay_watch(&both, false, true).expect("the editor holds it");
+        assert!(!alone.help && alone.editor);
+        assert!(fold_overlay_watch(&both, false, false).is_none());
     }
 
     #[test]
@@ -2151,7 +2237,11 @@ mod tests {
 
     #[test]
     fn degraded_poll_gpu_marks_dead_without_window() {
+        // The machine (audit 101126 §S3): a vanished init degrades the
+        // window once — Dead is terminal, so a second poll is a no-op.
         let now = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel::<crate::render::GpuInit>();
+        drop(sender);
         let mut app = PopupApp {
             cfg: agnosis_core::config::Config::default(),
             args: args(640, 480),
@@ -2160,9 +2250,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Awaiting(receiver),
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2185,8 +2273,10 @@ mod tests {
             pointer: (0, 0),
         };
         app.poll_gpu();
-        assert!(!app.gpu_dead);
-        assert!(app.renderer.is_none());
+        assert!(matches!(app.gpu, Gpu::Dead), "a vanished init degrades");
+        // Degraded is terminal: a second poll changes nothing.
+        app.poll_gpu();
+        assert!(matches!(app.gpu, Gpu::Dead));
     }
 
     #[test]
@@ -2417,9 +2507,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2466,9 +2554,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2492,6 +2578,11 @@ mod tests {
         };
         assert_eq!(app.compose_input_line(), "ADD BALLOON: ducks_");
         app.feedback = Some(("ADDED DUCKS".to_string(), now, FEEDBACK_LIFETIME));
+        // The buffer wins over fresh feedback: during "LOADING X" the
+        // user's next typing used to be invisible, and Enter committed
+        // text they never saw (audit 101126 §B7).
+        assert_eq!(app.compose_input_line(), "ADD BALLOON: ducks_");
+        app.input.clear();
         assert_eq!(app.compose_input_line(), "ADDED DUCKS");
         // Empty buffer: the short usage hint (name, folder, shot, editor,
         // help).
@@ -2530,9 +2621,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2601,9 +2690,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2659,9 +2746,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -2749,9 +2834,11 @@ mod tests {
         // developer machine is a big tree) made the test race its own
         // budget (audit 2026-10-21 §G11).
         let dir = temp_dir("balloon-loader");
-        let loader = BalloonLoader::start().expect("the loader thread starts");
+        let mut loader = BalloonLoader::start().expect("the loader thread starts");
         assert!(
-            loader.request(&dir, "definitely-not-a-balloon", 4, 2),
+            loader
+                .request(&dir, "definitely-not-a-balloon", 4, 2)
+                .is_ok(),
             "the request is queued"
         );
         // The answer arrives on the channel, not inline.
@@ -2771,6 +2858,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(seen, "the loader must answer the request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_name_asked_twice_converts_once() {
+        // The in-flight set is the request identity the channel alone
+        // could not carry: two Enters on one name used to queue two
+        // conversions and push two copies of the same balloon into the
+        // ring (audit 101126 §B6).
+        let dir = temp_dir("balloon-loader-dupe");
+        let mut loader = BalloonLoader::start().expect("the loader thread starts");
+        assert!(loader.request(&dir, "no-such-balloon", 4, 2).is_ok());
+        assert!(
+            matches!(
+                loader.request(&dir, "no-such-balloon", 4, 2),
+                Err(LoadReject::InFlight)
+            ),
+            "the duplicate is refused, not queued"
+        );
+        // The answer frees the name: it can be asked again.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if !loader.drain().is_empty() {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(seen, "the loader must answer the request");
+        assert!(
+            loader.request(&dir, "no-such-balloon", 4, 2).is_ok(),
+            "the answered name can be asked again"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2817,9 +2938,7 @@ mod tests {
             font: None,
             watcher: None,
             loader: None,
-            gpu_rx: None,
-            gpu_dead: false,
-            renderer: None,
+            gpu: Gpu::Dead,
             first_frame: false,
             last_tick: now,
             next_frame: now,
@@ -3001,6 +3120,7 @@ mod tests {
         app.loader = Some(BalloonLoader {
             requests: req_tx,
             results: res_rx,
+            pending: std::collections::HashSet::new(),
         });
         app.drain_loader_into_scene();
         let scene = app.scene.as_ref().expect("scene");

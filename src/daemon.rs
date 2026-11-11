@@ -464,7 +464,16 @@ impl ActionSteps for PlatformSteps {
     fn minimize_browsers(&mut self, names: &[String], own_pid: u32) -> Result<usize, String> {
         let record = minimize::minimize_and_record(names, own_pid).map_err(|e| e.to_string())?;
         let count = record.len();
-        self.hidden = Some(record);
+        // The record is **merged**, not replaced: a pass that ran between
+        // the parade's close and the restore used to orphan the previous
+        // pass's windows — hidden and never put back (audit 101126 §B5).
+        match self.hidden.take() {
+            Some(mut held) => {
+                held.merge(record);
+                self.hidden = Some(held);
+            }
+            None => self.hidden = Some(record),
+        }
         Ok(count)
     }
 

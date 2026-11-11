@@ -153,6 +153,62 @@ pub fn record_with_hud(
     assets: &AssetDirs,
     counter_line: Option<&str>,
 ) -> Result<Recording, ExportError> {
+    record_scene(
+        cfg,
+        frames,
+        fps,
+        counter_line,
+        |cfg, cols, rows, cell_w, cell_h| {
+            let mut scene = Scene::new_with_assets(cfg, cols, rows, cell_w, cell_h, assets);
+            // The backdrop pictures are converted **here**, on the export's
+            // own thread: the conversion is an image decode, and the export
+            // already runs off the UI thread. The pictures are **absolute**
+            // paths: the shell resolved the configured names before the core
+            // saw them.
+            install_backdrops(&mut scene, cfg);
+            Ok(scene)
+        },
+    )
+}
+
+/// Record the parade with the drawn art answered by a **loader closure**
+/// — the injectable seam ([`Scene::build`]), for a host with no asset
+/// folders (the browser).
+///
+/// The scene carries **no backdrop pictures**: a host that cannot read
+/// a file cannot show one, and this is exactly the scene the web front
+/// end builds for its own parade, so the export shows what the page
+/// shows.
+pub fn record_with_loader(
+    cfg: &Config,
+    frames: u32,
+    fps: u32,
+    load: impl Fn(
+        crate::drawn::DrawnKind,
+        &str,
+    ) -> Result<crate::drawn::DrawnSprite, crate::drawn::DrawnError>,
+) -> Result<Recording, ExportError> {
+    record_scene(cfg, frames, fps, None, |cfg, cols, rows, cell_w, cell_h| {
+        Ok(Scene::build(cfg, cols, rows, cell_w, cell_h, load, None))
+    })
+}
+
+/// The shared recording body: validate, build the scene the factory
+/// hands over, capture the static HUD, and advance the fixed timestep
+/// into the codec.
+///
+/// WHY the factory: the two scene builders — the shell's (folders on
+/// disk, backdrop pictures) and the web's (an in-memory store, no
+/// pictures) — differ in exactly that one step, and everything around
+/// it (the grid, the font, the message band, the frame loop) must not
+/// drift between them.
+fn record_scene(
+    cfg: &Config,
+    frames: u32,
+    fps: u32,
+    counter_line: Option<&str>,
+    make_scene: impl FnOnce(&Config, usize, usize, u32, u32) -> Result<Scene, ExportError>,
+) -> Result<Recording, ExportError> {
     if frames == 0 {
         return Err(ExportError::Config(
             "a recording needs at least one frame".into(),
@@ -168,12 +224,7 @@ pub fn record_with_hud(
     let (cols, rows, cell_w, cell_h) =
         cfg.grid_for_monitor(RECORD_MONITOR_W, RECORD_MONITOR_H, 1.0);
     let mut font = Font::new(cell_w, cell_h).map_err(|e| ExportError::Font(e.to_string()))?;
-    let mut scene = Scene::new_with_assets(&cfg, cols, rows, cell_w, cell_h, assets);
-    // The backdrop pictures are converted **here**, on the export's own
-    // thread: the conversion is an image decode, and the export already
-    // runs off the UI thread. The pictures are **absolute** paths: the
-    // shell resolved the configured names before the core saw them.
-    install_backdrops(&mut scene, &cfg);
+    let mut scene = make_scene(&cfg, cols, rows, cell_w, cell_h)?;
     scene.set_counter_line(counter_line.map(|line| line.to_string()));
     let ground_row = scene.ground_row().max(0) as usize;
     let mut encoder = Encoder::new(cols, rows, cell_w, cell_h, ground_row, fps);
@@ -229,6 +280,59 @@ pub fn render_pixels(
     scale: u32,
     assets: &AssetDirs,
 ) -> Result<Vec<crate::export::gif::GifFrame>, ExportError> {
+    render_pixel_scene(
+        cfg,
+        frames,
+        fps,
+        scale,
+        |cfg, cols, rows, cell_w, cell_h| {
+            let mut scene = Scene::new_with_assets(cfg, cols, rows, cell_w, cell_h, assets);
+            install_backdrops(&mut scene, cfg);
+            Ok(scene)
+        },
+    )
+}
+
+/// Render the parade's pixel frames with the drawn art answered by a
+/// **loader closure** — the injectable seam ([`Scene::build`]), for a
+/// host with no asset folders (the browser).
+///
+/// No backdrop pictures, exactly like [`record_with_loader`]: the
+/// export shows what the page shows.
+pub fn render_pixels_with_loader(
+    cfg: &Config,
+    frames: u32,
+    fps: u32,
+    scale: u32,
+    load: impl Fn(
+        crate::drawn::DrawnKind,
+        &str,
+    ) -> Result<crate::drawn::DrawnSprite, crate::drawn::DrawnError>,
+) -> Result<Vec<crate::export::gif::GifFrame>, ExportError> {
+    render_pixel_scene(
+        cfg,
+        frames,
+        fps,
+        scale,
+        |cfg, cols, rows, cell_w, cell_h| {
+            Ok(Scene::build(cfg, cols, rows, cell_w, cell_h, load, None))
+        },
+    )
+}
+
+/// The shared pixel-render body: validate, build the scene the factory
+/// hands over, and advance the fixed timestep into downscaled frames.
+///
+/// WHY the factory: the same one-scene-step difference as
+/// [`record_scene`] — the shell reads folders, the browser reads its
+/// in-memory store — and the loop must not drift between them.
+fn render_pixel_scene(
+    cfg: &Config,
+    frames: u32,
+    fps: u32,
+    scale: u32,
+    make_scene: impl FnOnce(&Config, usize, usize, u32, u32) -> Result<Scene, ExportError>,
+) -> Result<Vec<crate::export::gif::GifFrame>, ExportError> {
     if frames == 0 {
         return Err(ExportError::Config(
             "a recording needs at least one frame".into(),
@@ -246,8 +350,7 @@ pub fn render_pixels(
     let (cols, rows, cell_w, cell_h) =
         cfg.grid_for_monitor(RECORD_MONITOR_W, RECORD_MONITOR_H, 1.0);
     let mut font = Font::new(cell_w, cell_h).map_err(|e| ExportError::Font(e.to_string()))?;
-    let mut scene = Scene::new_with_assets(&cfg, cols, rows, cell_w, cell_h, assets);
-    install_backdrops(&mut scene, &cfg);
+    let mut scene = make_scene(&cfg, cols, rows, cell_w, cell_h)?;
     let width = cols as u32 * cell_w;
     let height = rows as u32 * cell_h;
     let mut fb = crate::blit::FrameBuffer::new(width, height);
@@ -340,6 +443,8 @@ fn sum_source_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balloon::AsciiSprite;
+    use crate::drawn::{DrawnError, DrawnKind, DrawnSize, DrawnSprite};
     use crate::export::codec::decode;
     use crate::grid::Grid;
 
@@ -464,6 +569,71 @@ mod tests {
         )
         .expect_err("too many frames is refused");
         assert!(matches!(err, ExportError::Config(_)), "{err:?}");
+    }
+
+    /// The loader a host without folders carries: every name is
+    /// refused, so the built-in art stays.
+    fn missing_art(kind: DrawnKind, name: &str) -> Result<DrawnSprite, DrawnError> {
+        let _ = kind;
+        Err(DrawnError::NotFound {
+            name: name.to_string(),
+        })
+    }
+
+    /// A hand-drawn sprite: the duck's big frame with a solid ink block
+    /// on top, so the parade it joins looks unlike the built-in one.
+    fn hand_drawn_sprite() -> DrawnSprite {
+        let (cols, rows) = crate::drawn::sprite_frame_size(DrawnSize::Big);
+        let mut frame = AsciiSprite::new(cols, rows);
+        for row in 0..4 {
+            for col in 0..40 {
+                frame.set(col, row, 'X', [255, 0, 255]);
+            }
+        }
+        DrawnSprite {
+            kind: DrawnKind::Sprite,
+            size: Some(DrawnSize::Big),
+            frames: vec![frame],
+            reaction: None,
+        }
+    }
+
+    #[test]
+    fn the_loader_path_matches_the_folder_path_on_the_built_in_art() {
+        // An empty AssetDirs means "the built-in art only", and the
+        // default config names no backdrop picture — so the folder path
+        // and the loader path build the same scene and must record the
+        // same bytes.
+        let via_folders =
+            record(&Config::default(), 3, DEFAULT_FPS, &AssetDirs::default()).expect("recording");
+        let via_loader =
+            record_with_loader(&Config::default(), 3, DEFAULT_FPS, missing_art).expect("recording");
+        assert_eq!(via_folders.blob, via_loader.blob);
+    }
+
+    #[test]
+    fn the_loader_seam_feeds_the_drawn_art_into_the_blob() {
+        // big_1 is assigned to a drawn sprite: the loader that answers
+        // the name and the loader that refuses it record different
+        // parades, so the seam really feeds the custom art.
+        let mut cfg = Config::default();
+        cfg.assignments.big_1 = Some("hand drawn".to_string());
+        let with_art = record_with_loader(&cfg, 3, DEFAULT_FPS, |kind, name| {
+            let _ = (kind, name);
+            Ok(hand_drawn_sprite())
+        })
+        .expect("recording");
+        let without_art = record_with_loader(&cfg, 3, DEFAULT_FPS, missing_art).expect("recording");
+        assert_ne!(with_art.blob, without_art.blob);
+    }
+
+    #[test]
+    fn the_pixel_frames_come_from_the_loader_path_too() {
+        let frames = render_pixels_with_loader(&Config::default(), 2, DEFAULT_FPS, 2, missing_art)
+            .expect("frames");
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].width > 0, "the downscaled frame is not empty");
+        assert!(frames[0].height > 0, "the downscaled frame is not empty");
     }
 
     #[test]

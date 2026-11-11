@@ -1,4 +1,4 @@
-﻿//! Trailing-balloon pendulum: a damped, periodically driven swing integrated
+//! Trailing-balloon pendulum: a damped, periodically driven swing integrated
 //! at a fixed 1/120 s substep.
 //!
 //! The drive term keeps the motion alive indefinitely; a bare damped pendulum
@@ -14,10 +14,6 @@ pub const SUBSTEP_SECONDS: f32 = 1.0 / 120.0;
 /// fixed 1/120 s substep keeps semi-implicit Euler far inside its stable
 /// region for these constants.
 const MAX_CARRY_SECONDS: f32 = 8192.0;
-
-/// Defensively clamp the clock fed to the drive term so `sin` never sees an
-/// absurd argument after days of uptime.
-const MAX_CLOCK_SECONDS: f64 = 10_000.0;
 
 /// Driven pendulum state `(theta, omega)` in radians.
 pub struct Pendulum {
@@ -51,6 +47,15 @@ impl Pendulum {
     #[cfg(any(test, feature = "test-support"))]
     pub fn theta(&self) -> f32 {
         self.theta
+    }
+
+    /// Current angular velocity in radians per second.
+    ///
+    /// Test-only, like [`Pendulum::theta`]: the drive's wrap-continuity
+    /// test (audit 101126 §C6) asserts on the per-step velocity jump.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn omega(&self) -> f32 {
+        self.omega
     }
 
     /// Advance with fixed 1/120 s substeps and an accumulator; leftover time
@@ -116,8 +121,15 @@ impl Pendulum {
         } else {
             1.6
         };
-        self.time = (self.time + h as f64).rem_euclid(MAX_CLOCK_SECONDS);
-        let drive = a * (2.0 * std::f64::consts::PI * self.time / period).sin();
+        self.time += h as f64;
+        // The drive **phase** is wrapped, not the absolute clock: a wrap
+        // at a fixed second count is phase-continuous only for periods
+        // that divide it, and any other configured `pendulum_period` took
+        // a one-frame drive jump at the wrap (audit 101126 §B2). `sin`
+        // still never sees an absurd argument — the phase is folded to
+        // one turn, however long the parade runs.
+        let phase = (std::f64::consts::TAU * self.time / period).rem_euclid(std::f64::consts::TAU);
+        let drive = a * phase.sin();
         let accel = -(g / l) * self.theta as f64 - c * self.omega as f64 + drive;
         self.omega = (self.omega as f64 + accel * h as f64) as f32;
         self.theta = (self.theta as f64 + self.omega as f64 * h as f64) as f32;
@@ -207,5 +219,41 @@ mod tests {
         let mut r = Pendulum::new(0.3);
         r.advance(f32::NAN, &cfg(), 40.0);
         assert_eq!(r.theta(), 0.3);
+    }
+
+    #[test]
+    fn the_drive_is_continuous_across_the_old_clock_wrap() {
+        // The drive used to wrap the absolute clock at a fixed second
+        // count; any `pendulum_period` that does not divide it took a
+        // one-frame drive jump there (audit 101126 §C6). March past that
+        // count with a deliberately non-dividing period: the per-step
+        // velocity change across it must stay inside the ordinary
+        // pace, twice over.
+        let mut cfg = cfg();
+        cfg.pendulum_period = 1.55;
+        let mut p = Pendulum::new(0.3);
+        // 166 whole minutes put the clock at 9960 s — under the old
+        // wrap point of 10 000 s and under the carry cap per call.
+        for _ in 0..166 {
+            p.advance(60.0, &cfg, 65.0);
+        }
+        // The two seconds before the old wrap set the ordinary pace.
+        let mut ordinary = 0.0f32;
+        for _ in 0..240 {
+            let before = p.omega();
+            p.advance(SUBSTEP_SECONDS, &cfg, 65.0);
+            ordinary = ordinary.max((p.omega() - before).abs());
+        }
+        // Ten more seconds cross the old wrap (1.67 s in) and keep
+        // going: every step stays ordinary.
+        for _ in 0..1200 {
+            let before = p.omega();
+            p.advance(SUBSTEP_SECONDS, &cfg, 65.0);
+            let jump = (p.omega() - before).abs();
+            assert!(
+                jump <= ordinary * 2.0 + 1e-9,
+                "the drive jumped: {jump} vs the ordinary {ordinary}"
+            );
+        }
     }
 }
