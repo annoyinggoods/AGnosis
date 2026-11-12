@@ -169,6 +169,20 @@ pub fn drawn_save(
     agnosis_core::drawn::save_to(&dir, sprite, kind, name)
 }
 
+/// Load a drawn asset from the platform's drawn-asset folder.
+///
+/// The element picker's loader: picking a slot that carries an
+/// assignment puts **that** document back on the canvas (2026-11-12).
+/// The name is validated inside `drawn::load_from`, so a name can never
+/// escape the asset folder.
+pub fn drawn_load(
+    kind: DrawnKind,
+    name: &str,
+) -> Result<agnosis_core::drawn::DrawnSprite, DrawnError> {
+    let dir = drawn_dir_for(kind)?;
+    agnosis_core::drawn::load_from(&dir, kind, name)
+}
+
 /// The assets of `kind`, **from the cache**: the name and the size
 /// class of every file in the folder.
 ///

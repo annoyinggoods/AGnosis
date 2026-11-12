@@ -12,6 +12,7 @@
 //!
 //! * [`app`] — the frame loop, the canvas and the clock.
 //! * [`assets_io`] — the drawn art in memory and the two imports.
+//! * [`editor_io`] — the draw-your-own editor, in a browser tab.
 //! * [`export_io`] — the three downloads: the page, the GIF and the
 //!   art package.
 //! * [`input`] — the mouse.
@@ -19,6 +20,7 @@
 
 mod app;
 mod assets_io;
+pub mod editor_io;
 mod export_io;
 mod input;
 pub mod render;
@@ -137,6 +139,153 @@ pub fn export_package(name: &str) -> Result<Vec<u8>, String> {
 #[wasm_bindgen]
 pub fn status_line() -> String {
     app::with_app(|state| app::status_line(state)).unwrap_or_else(|| "starting".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The draw-your-own editor (roadmap WASM §6, milestone M3).
+//
+// The editor owns its own `<canvas id="editor-canvas">` element — a
+// canvas carries one context type for its whole life, and the editor's
+// is the plain 2D one while the parade's is the GPU's. The page forwards
+// its events here; every event may leave a download (a save) or a config
+// (a settings or assign change) behind, which the page drains through
+// [`editor_take_download`].
+// ---------------------------------------------------------------------------
+
+/// Open the draw-your-own editor on the page's `#editor-canvas`.
+///
+/// The parade is paused for the session and restored on close. Opening
+/// is idempotent: a second call while the editor is up changes nothing.
+/// The call fails when the parade has not started or the page has no
+/// editor canvas — the error says which.
+#[wasm_bindgen]
+pub fn editor_open() -> Result<(), String> {
+    editor_io::view::open()
+}
+
+/// Close the editor and hand the parade back.
+///
+/// The editor's config changes have already reached the parade (each
+/// one was applied the moment it was made), so closing is only the
+/// pause state's return.
+#[wasm_bindgen]
+pub fn editor_close() {
+    editor_io::view::close();
+}
+
+/// Is the editor open? The page mirrors the DOM to this answer after
+/// every event it forwards — an ESC that ran out of ladder rungs closes
+/// the editor from inside the wasm, and the page follows.
+#[wasm_bindgen]
+pub fn editor_is_open() -> bool {
+    editor_io::view::is_open()
+}
+
+/// A pointer press on the editor canvas, in **canvas pixels**.
+///
+/// The page converts the browser's page coordinates through the canvas'
+/// bounding box (`(clientX - rect.left) * canvas.width / rect.width`),
+/// so the model sees the same pixel space its layout runs on.
+#[wasm_bindgen]
+pub fn editor_pointer_down(x: f64, y: f64) {
+    editor_io::view::pointer_down(x, y);
+}
+
+/// A pointer move on the editor canvas, in canvas pixels. A move with a
+/// stroke open paints; a move with a slider drag held drags it.
+#[wasm_bindgen]
+pub fn editor_pointer_move(x: f64, y: f64) {
+    editor_io::view::pointer_move(x, y);
+}
+
+/// A pointer release: the stroke is over.
+#[wasm_bindgen]
+pub fn editor_pointer_up() {
+    editor_io::view::pointer_up();
+}
+
+/// A wheel notch over the editor canvas, in **line units** (positive
+/// scrolls down; `dx` is the sideways gesture). The page converts the
+/// browser's pixel deltas (`deltaMode` 0) to line units first — a pixel
+/// delta divided by the cell pitch, the native wheel's own rule.
+#[wasm_bindgen]
+pub fn editor_wheel(dx: f64, dy: f64) {
+    editor_io::view::wheel(dx, dy);
+}
+
+/// One key press, forwarded from the page.
+///
+/// `key` is the `KeyboardEvent.key` value and the booleans are the
+/// modifiers. The page suppresses the browser's own answers for the
+/// keys the editor consumes (arrows, Space, Backspace, Enter, Escape,
+/// F1–F4, `Ctrl+Z`/`Ctrl+Y`) before forwarding.
+#[wasm_bindgen]
+pub fn editor_key(key: &str, ctrl: bool, shift: bool, alt: bool, meta: bool) {
+    editor_io::view::key(editor_io::KeyEvent {
+        key: key.to_string(),
+        ctrl,
+        shift,
+        alt,
+        meta,
+    });
+}
+
+/// The page's window resized: the editor re-lays its buffer.
+#[wasm_bindgen]
+pub fn editor_resize() {
+    editor_io::view::resize();
+}
+
+/// The line the page's status region mirrors (an aria-live region).
+///
+/// A toast wins while one is up — the same discipline the editor's own
+/// status line follows on the canvas.
+#[wasm_bindgen]
+pub fn editor_status() -> String {
+    editor_io::view::status_line()
+}
+
+/// One download the editor produced, for the page to save.
+#[wasm_bindgen]
+pub struct EditorDownload {
+    name: String,
+    mime: String,
+    data: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl EditorDownload {
+    /// The file name the page saves under (`sprite-1.json`).
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// The MIME type of the blob.
+    #[wasm_bindgen(getter)]
+    pub fn mime(&self) -> String {
+        self.mime.clone()
+    }
+
+    /// The bytes.
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+}
+
+/// Drain one download the editor produced (the save's document).
+///
+/// The page polls this after every event it forwards; downloads queue
+/// in the order they were made and come out first in, first out.
+/// `undefined` when nothing is waiting.
+#[wasm_bindgen]
+pub fn editor_take_download() -> Option<EditorDownload> {
+    editor_io::view::take_download().map(|pending| EditorDownload {
+        name: pending.name,
+        mime: pending.mime.to_string(),
+        data: pending.bytes,
+    })
 }
 
 /// Show a message in the page's diagnostic box.

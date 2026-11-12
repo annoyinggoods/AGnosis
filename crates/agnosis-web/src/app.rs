@@ -116,8 +116,13 @@ pub struct Sim {
     /// The drawn assets the page carries.
     ///
     /// A browser has no asset folder, so the art lives in memory and the
-    /// scene's injectable loader asks this store for it by name.
-    pub assets: AssetStore,
+    /// scene's injectable loader asks this store for it by name. The
+    /// store is **shared** (`Rc<RefCell>`) with the draw-your-own editor
+    /// (roadmap WASM §6): a sprite the editor saves is in the parade's
+    /// store the moment it lands, and a package the page imports is in
+    /// the editor's assign panel without a restart — one store, one
+    /// truth, no sync pass between the two.
+    pub assets: Rc<RefCell<AssetStore>>,
 }
 
 /// The backend-swap machine (audit 101126 §W1): what the page asked for
@@ -306,7 +311,7 @@ fn new_state(
 ) -> Result<AppState, String> {
     let (cols, rows, cell_w, cell_h) = geometry(cfg, canvas);
     let font = Font::new(cell_w, cell_h).map_err(|e| format!("cannot open the font: {e}"))?;
-    let assets = AssetStore::new();
+    let assets = Rc::new(RefCell::new(AssetStore::new()));
     let scene = build_scene(cfg, &assets, cols, rows, cell_w, cell_h);
     let fb = FrameBuffer::new(cols as u32 * cell_w, rows as u32 * cell_h);
     // The canvas' drawing buffer IS the frame: the page scales the
@@ -381,7 +386,7 @@ fn to_pixels(value: i32) -> u32 {
 
 /// The device pixel ratio: the CSS pixels the page uses times this is
 /// the physical pixels the canvas draws into.
-fn device_pixel_ratio() -> f64 {
+pub(crate) fn device_pixel_ratio() -> f64 {
     web_sys::window()
         .map(|w| w.device_pixel_ratio())
         .unwrap_or(1.0)
@@ -391,16 +396,20 @@ fn device_pixel_ratio() -> f64 {
 /// The scene over the in-memory assets.
 ///
 /// The **injectable** constructor is the one the web uses: the core
-/// never reaches for a folder, the page's own store answers.
+/// never reaches for a folder, the page's own store answers. The store
+/// is shared with the editor, so the loader borrows it **per call** —
+/// a short-lived [`RefCell`] borrow inside the closure, never a borrow
+/// held across the scene build (audit 2026-10-21 §E8's shape).
 pub fn build_scene(
     cfg: &Config,
-    assets: &AssetStore,
+    assets: &Rc<RefCell<AssetStore>>,
     cols: usize,
     rows: usize,
     cell_w: u32,
     cell_h: u32,
 ) -> Scene {
-    let loader = |kind: DrawnKind, name: &str| assets.load(kind, name);
+    let loader_store = Rc::clone(assets);
+    let loader = move |kind: DrawnKind, name: &str| loader_store.borrow().load(kind, name);
     Scene::build(cfg, cols, rows, cell_w, cell_h, loader, None)
 }
 
@@ -763,7 +772,7 @@ pub fn status_line(state: &AppState) -> String {
         "{backend} | {}x{} cells | {running} | {} drawn assets",
         state.sim.cols,
         state.sim.rows,
-        state.sim.assets.len()
+        state.sim.assets.borrow().len()
     );
     // The back end that is on its way in: the page must say that a
     // switch is in flight, or it shows the **old** back end with no

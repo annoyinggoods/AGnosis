@@ -30,3 +30,7 @@ selftest_out/
 
 # Python bytecode from the web tools (pngcheck, serve, force-backend).
 __pycache__/
+REVIEW/agnosis-load1.png
+REVIEW/agnosis-load2.png
+REVIEW/agnosis-load3.png
+REVIEW/agnosis-load4.png

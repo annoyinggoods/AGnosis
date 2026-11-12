@@ -245,7 +245,7 @@ and put it into the parade.
 The editor window has **no title bar, no close button and no system menu** —
 it is borderless on purpose, so that the mouse coordinates the window reports
 line up with the canvas pixels. It is not fullscreen either: it is sized to
-80 % of the monitor (at least 1122 × 600, at most 1920 × 1200) and centred on
+80 % of the monitor (at least 1344 × 600, at most 1920 × 1200) and centred on
 it. The floor is the width the top bar's controls need, so the name field
 can never be squeezed out of sight while it is being typed into; the OS
 enforces it, so the window cannot be dragged below it.
@@ -258,7 +258,7 @@ follow the new size.
 
 ### Drawing
 
-The top bar carries three dropdowns, the asset-name field and the
+The top bar carries four dropdowns, the asset-name field and the
 `CFG` / `ASSIGN` / `DRAW` mode buttons (see *Settings mode* and *Assign
 mode* below):
 
@@ -267,13 +267,27 @@ mode* below):
 | 1 | `BAL` / `SPR` / `GRS` / `DEC` | a balloon, a walking sprite, a grass tile or a duck decoration |
 | 2 | `BIG` / `SML` | the duck size — greyed out while a balloon is picked |
 | 3 | `1` … `4` | one static frame, or 2–4 animation poses — greyed out while a balloon is picked |
+| 4 | `1` … `11` | **which element of the parade you are drawing** — the parade's own numbering |
+
+The fourth dropdown is the **element picker**: big ducks are `1`–`2`, small
+ducks `3`–`11` (the numbering of the train, not of the config keys),
+balloons `1`–`5`, decorations `1` (big) / `2` (small); a grass tile has no
+picker, because there is one tile. Picking a slot that carries an
+assignment **loads that document for editing** — the canvas, the frames and
+the name come from it, and a save writes the document back under its own
+name and points the slot at it. An unassigned slot starts a fresh document,
+like the picker was never there. Any other existing name is still refused
+on save: only the loaded document may be overwritten.
 
 The canvas is the element's own cell grid: **150 × 150 cells** for the big
 duck, 75 × 75 for the small one, and for a balloon the **disc** the parade
 draws — 109 × 73 cells at the default balloon radius. Only the frame
 rectangle at the top-left is drawable (150 × 70 for the big duck, 75 × 35 for
 the small one); for a balloon only the disc is. Everything else is plain
-background and cannot be painted.
+background and cannot be painted. The drawable region is **outlined**
+(`+` corners, `|` and `-` edges) and carries a small `.` at every second
+cell intersection, so the grid is visible on the black background — and
+neither the outline nor the dots are ever part of the saved art.
 
 A balloon's canvas is not square, and that is the point: a character cell
 is taller than it is wide, so a disc that is 3:2 **in cells** is a
@@ -312,10 +326,11 @@ spacing never changes.
 
 The top bar's **`ASSIGN`** button switches the editor from drawing to
 assignment: the canvas area becomes the assignment panel — the sixteen
-parade slots on the left (`BIG 1`, `BIG 2`, `SMALL 1` … `SMALL 9`,
-`BALLOON 1` … `BALLOON 5`) and, on the right, the drawn assets of the
-selected slot's kind (sprites for the ducks, balloons for the balloon
-slots). Click a slot to select it and click an asset to point the slot at
+parade slots on the left (`BIG 1`, `BIG 2`, `SMALL 3` … `SMALL 11`,
+`BALLOON 1` … `BALLOON 5` — the small ducks carry the parade's own
+numbering, so `SMALL 3` is config key `small_1`) and, on the right, the
+drawn assets of the selected slot's kind (sprites for the ducks, balloons
+for the balloon slots). Click a slot to select it and click an asset to point the slot at
 it: the editor writes the `[assignments]` table into your `config.toml` and
 the status line reports `ASSIGNED <SLOT> = <NAME>`. The **`CLEAR`** button
 below the slot list takes the assignment out again. The **`DRAW`** button

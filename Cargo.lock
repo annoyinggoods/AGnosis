@@ -61,6 +61,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "toml",
+ "web-time",
 ]
 
 [[package]]
@@ -74,6 +75,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
  "wgpu",
 ]
 

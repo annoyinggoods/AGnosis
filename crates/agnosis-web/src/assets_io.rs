@@ -24,10 +24,21 @@
 //!   write half, `package::import_from`, writes to a folder, and a
 //!   browser has no folder).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use agnosis_core::config::Config;
 use agnosis_core::drawn::{DrawnDoc, DrawnError, DrawnKind, DrawnSprite};
 use agnosis_core::manifest::{Manifest, MANIFEST_ENTRY};
 use agnosis_core::package::ZipArchive;
+
+/// The store the parade and the editor share.
+///
+/// The parade's scene loads its drawn art through this handle and the
+/// draw-your-own editor saves into it (roadmap WASM §6): one store, one
+/// truth. The [`RefCell`] is why the loader closures borrow it **per
+/// call** — never a borrow held across a scene reload.
+pub type SharedStore = Rc<RefCell<AssetStore>>;
 
 /// The drawn assets the page carries.
 ///
@@ -175,24 +186,26 @@ fn apply(
     // a config that came out is committed. Inserting into the live store
     // first used to leave the assets in it when the config half failed,
     // and their names leaked into the next import (audit 101126 §B8).
-    let mut next = state.sim.assets.clone();
+    let mut next = state.sim.assets.borrow().clone();
     for (kind, name, sprite) in assets {
         next.insert(kind, name, sprite);
     }
     let cfg = config_of(&manifest, &next)?;
-    state.sim.assets = next;
+    *state.sim.assets.borrow_mut() = next;
     // The scene is **reloaded in place**: the core's injectable reload
     // path (`Scene::apply_config_with`) reads the assets through the
     // loader, so the web's in-memory store answers it. The parade keeps
     // its phase, its balloons and its clock — a rebuilt scene would
     // restart the train at the left edge (audit 2026-10-21 §E8).
-    let assets_store = state.sim.assets.clone();
-    state
-        .sim
-        .scene
-        .apply_config_with(&cfg, |kind, name| assets_store.load(kind, name), None);
+    let loader_store = Rc::clone(&state.sim.assets);
+    state.sim.scene.apply_config_with(
+        &cfg,
+        |kind, name| loader_store.borrow().load(kind, name),
+        None,
+    );
     state.sim.cfg = cfg;
-    Ok(summary(&manifest, &state.sim.assets))
+    let summary = summary(&manifest, &state.sim.assets.borrow());
+    Ok(summary)
 }
 
 /// The config a manifest describes.

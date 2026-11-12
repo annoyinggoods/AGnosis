@@ -29,3 +29,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.6"
 thiserror = "2.0.21"
+# The editor's clock type. On native this IS the std `Instant` (a re-export),
+# so the shell's `Instant::now` and every test keep compiling unchanged; on
+# `wasm32-unknown-unknown` the std `Instant::now` panics ("time not
+# implemented"), and this one is backed by the browser's `performance.now()`.
+web-time = "1.1.0"

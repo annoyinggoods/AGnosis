@@ -493,6 +493,15 @@ impl EditorApp {
         }
         self.state.armed_save = false;
         self.state.primary_action(now);
+        // The element picker's save points its slot at the document it
+        // wrote: the staged config write goes through the same writer the
+        // assign panel uses (2026-11-12 element picker).
+        if let Some(write) = self.state.assignment_request.take() {
+            let result = write_assign_write(write);
+            if let Err(e) = result {
+                self.state.set_toast_at(&format!("ASSIGN FAILED: {e}"), now);
+            }
+        }
     }
 
     /// Carry out the draft actions the state queued.
@@ -834,6 +843,11 @@ impl EditorApp {
         if self.state.armed_save {
             self.state.armed_save = false;
             self.state.primary_action(Instant::now());
+            // The picker's staged assignment goes out with the save, or
+            // the parade would keep showing the old art (2026-11-12).
+            if let Some(write) = self.state.assignment_request.take() {
+                let _ = write_assign_write(write);
+            }
         }
         self.state.flush_track_request();
         if self.state.has_unsaved_work() {
@@ -2005,6 +2019,7 @@ pub fn run(cfg: &agnosis_core::config::Config, args: &EditorArgs) -> Result<(), 
         next_free_name: Some(crate::host::drawn_next_free_name),
         list_assets: Some(crate::host::drawn_list_cached),
         save_asset: Some(crate::host::drawn_save),
+        load_asset: Some(crate::host::drawn_load),
         load_config: Some(load_config_for_edit),
     });
     // The folder the MIDI tracks live in, for the same reason.

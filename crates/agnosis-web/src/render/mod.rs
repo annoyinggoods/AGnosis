@@ -42,7 +42,7 @@
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
 
-mod canvas2d;
+pub(crate) mod canvas2d;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 

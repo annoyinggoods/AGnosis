@@ -22,7 +22,17 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The editor's clock type is **web-time**'s `Instant`, not the standard
+// library's: on every native target the two are the same type (web-time
+// re-exports `std::time::Instant`), so the shell's `Instant::now` and
+// every test compile unchanged — but on `wasm32-unknown-unknown` the
+// standard library's `Instant::now` **panics** ("time not implemented on
+// this platform"), and web-time's is backed by the browser's
+// `performance.now()` (roadmap WASM §6: the editor's state must run in
+// the browser too).
+use web_time::Instant;
 
 /// Canvas/tool cell size in pixels — big enough to click comfortably.
 pub const CANVAS_CELL_W: u32 = 16;
@@ -87,14 +97,28 @@ const TOAST_UI_ROW: i64 = 6;
 const BOX_UI_ROWS: u32 = 8;
 
 /// UI cells between two dropdown boxes.
-const BOX_GAP_UI_CELLS: u32 = 2;
+///
+/// One cell (6 px) instead of two: the top bar carries **four** boxes
+/// now, and the floor of a 1366 px screen had no room for the old gaps.
+const BOX_GAP_UI_CELLS: u32 = 1;
 
-/// UI cells of a dropdown box. The widest label (`BAL`, `SPR`, `BIG`,
-/// `SML`) is 18 block-font cells wide; two cells of padding make 20.
+/// UI cells of a dropdown box whose widest label is three block-font
+/// characters (`BAL`, `SPR`, `BIG`, `SML`): 18 cells plus two of padding
+/// make 20.
 const BOX_UI_CELLS: u32 = 20;
 
+/// UI cells of the frame-count box. Its labels are one digit (`1`..`4`):
+/// six cells of glyph plus two of padding.
+const FRAME_BOX_UI_CELLS: u32 = 8;
+
+/// UI cells of the element-picker box. Its widest label is two digits
+/// (`11`): twelve cells plus two of padding.
+const ELEMENT_BOX_UI_CELLS: u32 = 14;
+
 /// UI cells between the last dropdown box and the name field.
-const NAME_FIELD_GAP_UI_CELLS: u32 = 4;
+///
+/// Two cells, not four — the same floor reason as [`BOX_GAP_UI_CELLS`].
+const NAME_FIELD_GAP_UI_CELLS: u32 = 2;
 
 /// UI cells the name field needs before it is worth drawing.
 ///
@@ -108,8 +132,12 @@ pub const NAME_FIELD_MIN_UI_CELLS: u32 = 2 + (NAME_FIELD_MIN_CHARS + 1) * UI_CHA
 /// Characters the name field shows at its minimum width.
 const NAME_FIELD_MIN_CHARS: u32 = 3;
 
-/// UI cells the three dropdown boxes and the gap after them take.
-const TOP_BAR_LEFT_CELLS: u32 = 3 * BOX_UI_CELLS + 2 * BOX_GAP_UI_CELLS + NAME_FIELD_GAP_UI_CELLS;
+/// UI cells the four dropdown boxes and the gaps around them take.
+const TOP_BAR_LEFT_CELLS: u32 = 2 * BOX_UI_CELLS
+    + FRAME_BOX_UI_CELLS
+    + ELEMENT_BOX_UI_CELLS
+    + 3 * BOX_GAP_UI_CELLS
+    + NAME_FIELD_GAP_UI_CELLS;
 
 /// UI cells the **five** top-bar buttons take: `CFG`, `TRK`, `ASSIGN`,
 /// `DRAW` and `SAVE` — the labels the bar actually draws, not their
@@ -120,12 +148,16 @@ const TOP_BAR_BUTTON_CELLS: u32 = SETTINGS_BUTTON_UI_CELLS
     + DRAW_BUTTON_UI_CELLS
     + SAVE_BUTTON_UI_CELLS;
 
-/// UI cells the top bar needs at its narrowest: the dropdown boxes, the
-/// name field at its minimum, the gap and the **five** buttons (`CFG`,
-/// `TRK`, `ASSIGN`, `DRAW`, `SAVE` — audit 2026-10-23 §U-15).
+/// UI cells the top bar needs at its narrowest: the four dropdown boxes,
+/// the name field at its minimum, the gap and the **five** buttons
+/// (`CFG`, `TRK`, `ASSIGN`, `DRAW`, `SAVE` — audit 2026-10-23 §U-15).
 ///
 /// This is the floor of the editor's layout — the width below which a
-/// control would have to disappear.
+/// control would have to disappear. The fourth box (the element picker)
+/// was funded by per-box widths (the frame box's labels are one digit,
+/// the picker's two) and one-cell gaps, so the floor stayed below a
+/// 1366 px screen (2026-11-12 user report: the picker must not cost the
+/// small-screen editor).
 pub const TOP_BAR_MIN_CELLS: u32 =
     TOP_BAR_LEFT_CELLS + NAME_FIELD_MIN_UI_CELLS + NAME_FIELD_GAP_UI_CELLS + TOP_BAR_BUTTON_CELLS;
 
@@ -406,6 +438,45 @@ const FRAME_LABELS: [&str; 4] = ["1", "2", "3", "4"];
 /// The long forms of the frame-count dropdown, spelled out in the status
 /// line (decision D15).
 const FRAME_LONGS: [&str; 4] = ["STATIC", "2 FRAMES", "3 FRAMES", "4 FRAMES"];
+
+/// The options of the element picker for a **big** sprite: the parade's
+/// big ducks are ducks 1 and 2 (2026-11-12 user report).
+const ELEMENT_BIG_OPTIONS: [&str; 2] = ["1", "2"];
+
+/// The options of the element picker for a **small** sprite: the parade's
+/// small ducks are ducks 3 to 11 — the numbering is the parade's own, so
+/// the picker reads like the train (2026-11-12 user report).
+const ELEMENT_SMALL_OPTIONS: [&str; 9] = ["3", "4", "5", "6", "7", "8", "9", "10", "11"];
+
+/// The options of the element picker for a balloon: the five balloon
+/// slots of the parade.
+const BALLOON_NUMBER_OPTIONS: [&str; 5] = ["1", "2", "3", "4", "5"];
+
+/// The options of the element picker for a decoration: slot 1 is the big
+/// duck's decoration, slot 2 the small duck's.
+const DECO_NUMBER_OPTIONS: [&str; 2] = ["1", "2"];
+
+/// The box label of the element picker for element `n` (1-based).
+const ELEMENT_NUMBER_LABELS: [&str; 11] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"];
+
+/// The long form of the element picker for a **duck** — what the status
+/// line spells out.
+const ELEMENT_DUCK_LONGS: [&str; 11] = [
+    "DUCK 1", "DUCK 2", "DUCK 3", "DUCK 4", "DUCK 5", "DUCK 6", "DUCK 7", "DUCK 8", "DUCK 9",
+    "DUCK 10", "DUCK 11",
+];
+
+/// The long form of the element picker for a balloon.
+const ELEMENT_BALLOON_LONGS: [&str; 5] = [
+    "BALLOON 1",
+    "BALLOON 2",
+    "BALLOON 3",
+    "BALLOON 4",
+    "BALLOON 5",
+];
+
+/// The long form of the element picker for a decoration.
+const ELEMENT_DECO_LONGS: [&str; 2] = ["DECO 1", "DECO 2"];
 
 /// How many strokes the undo stack keeps (roadmap Extension 2 §2.1).
 ///
@@ -954,8 +1025,9 @@ pub struct EditorLayout {
     pub canvas_scroll_rows: usize,
     /// The first canvas column that is visible.
     pub canvas_scroll_cols: usize,
-    /// The three dropdown boxes, left to right (overlay layer).
-    pub dropdowns: [Rect; 3],
+    /// The four dropdown boxes, left to right (overlay layer): kind,
+    /// size, frame count and the element picker.
+    pub dropdowns: [Rect; 4],
     /// The name field in the top bar (overlay layer).
     pub name_field: Rect,
     /// The primary (SAVE) button in the top bar (overlay layer).
@@ -1096,15 +1168,27 @@ pub fn layout(window_w: u32, window_h: u32, state: &EditorState) -> EditorLayout
     }
 }
 
-/// The three dropdown boxes of the top bar, in pixels.
-fn dropdown_boxes() -> [Rect; 3] {
-    let w = BOX_UI_CELLS * UI_CELL_W;
-    let gap = BOX_GAP_UI_CELLS * UI_CELL_W;
+/// The four dropdown boxes of the top bar, in pixels.
+///
+/// The boxes are **not** one width: the kind and size labels are three
+/// characters, the frame-count labels are one digit and the element
+/// picker's are at most two — and the top bar's floor has no room for
+/// four full-width boxes (2026-11-12 element picker).
+fn dropdown_boxes() -> [Rect; 4] {
+    const BOX_WIDTHS: [u32; 4] = [
+        BOX_UI_CELLS,
+        BOX_UI_CELLS,
+        FRAME_BOX_UI_CELLS,
+        ELEMENT_BOX_UI_CELLS,
+    ];
+    let gap = i64::from(BOX_GAP_UI_CELLS * UI_CELL_W);
     let h = BOX_UI_ROWS * UI_CELL_H;
-    let mut boxes = [Rect::new(0, 0, w, h); 3];
+    let mut boxes = [Rect::new(0, 0, 0, h); 4];
+    let mut x = 0;
     for (index, rect) in boxes.iter_mut().enumerate() {
-        let x = i64::from(index as u32) * (i64::from(w) + i64::from(gap));
+        let w = BOX_WIDTHS[index] * UI_CELL_W;
         *rect = Rect::new(x, 0, w, h);
+        x = rect.right() + gap;
     }
     boxes
 }
@@ -1134,7 +1218,7 @@ pub const fn min_layout_width() -> u32 {
 /// narrower than [`min_layout_width`] cannot exist.
 fn name_field_rect(window_w: u32) -> Rect {
     let boxes = dropdown_boxes();
-    let last = boxes[2];
+    let last = boxes[3];
     let gap = NAME_FIELD_GAP_UI_CELLS * UI_CELL_W;
     let x = last.right() + i64::from(gap);
     let button = settings_button_rect(window_w);
@@ -1364,6 +1448,13 @@ pub type SaveAsset = fn(
     &str,
 ) -> Result<PathBuf, crate::drawn::DrawnError>;
 
+/// The load of a drawn asset, by kind and name — the element picker's
+/// seam (see [`EditorPlatform::load_asset`]).
+pub type LoadAsset = fn(
+    crate::drawn::DrawnKind,
+    &str,
+) -> Result<crate::drawn::DrawnSprite, crate::drawn::DrawnError>;
+
 /// The platform services the editor state needs.
 ///
 /// The **core** cannot list the platform's asset folder, read the
@@ -1396,6 +1487,14 @@ pub struct EditorPlatform {
     pub list_assets: Option<fn(crate::drawn::DrawnKind) -> Vec<crate::drawn::AssetEntry>>,
     /// The save of a drawn asset.
     pub save_asset: Option<SaveAsset>,
+    /// The load of a drawn asset, by kind and name.
+    ///
+    /// The element picker needs it: picking a slot that carries an
+    /// assignment must put **that** document on the canvas (2026-11-12
+    /// user decision). `None` means "nothing can be loaded" — the core's
+    /// own tests and any host without a folder — and the picker then
+    /// always starts a fresh document.
+    pub load_asset: Option<LoadAsset>,
     /// The user's config, **as the user wrote it** (no repair pass).
     pub load_config: Option<fn() -> Result<crate::config::Config, crate::config::ConfigError>>,
 }
@@ -1416,6 +1515,28 @@ pub struct EditorState {
     pub frames_wanted: usize,
     /// The frame that is being drawn, 0-based.
     pub frame_index: usize,
+    /// Which element of the parade the picker (dropdown 4) has: the
+    /// **parade's own numbering** — big ducks are ducks 1 and 2, small
+    /// ducks 3 to 11, balloons 1 to 5, a decoration 1 (big) or 2 (small).
+    /// A grass tile has no picker (it is one tile), so the number is
+    /// meaningless there.
+    pub element_number: usize,
+    /// The name of the document the picker **loaded for editing**, if
+    /// any. It is the one name a save may overwrite: editing in place is
+    /// the picker's whole point (2026-11-12 user decision). `None` while
+    /// a fresh document is on the canvas — then every existing name is
+    /// refused, as always.
+    pub editing: Option<String>,
+    /// The frames of a **loaded** document that come after the one on
+    /// the canvas. [`EditorState::advance_frame`] serves them one by one,
+    /// so a loaded multi-frame sprite is edited in its own order instead
+    /// of being rebuilt from blank canvases.
+    pub loaded_frames: Vec<crate::balloon::AsciiSprite>,
+    /// The assignment a completed save staged for the app to write: the
+    /// picker's slot points at the name that was just saved. The state
+    /// never writes the config file; it records the assignment in its
+    /// own copy and hands the write over (the `track_request` pattern).
+    pub assignment_request: Option<AssignWrite>,
     /// The frame that is being drawn: the element's canvas — square for a
     /// sprite, the balloon's disc for a balloon.
     pub canvas: crate::balloon::AsciiSprite,
@@ -1642,7 +1763,9 @@ impl EditorState {
     /// platform"), so the core must not call it on its own (audit
     /// 2026-10-21 §E3). The clock times the toast and the draft
     /// debounce; it is a plain function pointer, so the state stays
-    /// `Copy`-able and `Clone`.
+    /// `Copy`-able and `Clone`. The `Instant` is web-time's, whose
+    /// `now` works on the browser target too ([`web_time`]); the
+    /// native shell hands the same `Instant::now` it always did.
     ///
     pub fn new(cfg: &crate::config::Config, clock: fn() -> Instant) -> Self {
         let kind = crate::drawn::DrawnKind::Sprite;
@@ -1655,6 +1778,10 @@ impl EditorState {
             size,
             frames_wanted: 1,
             frame_index: 0,
+            element_number: 1,
+            editing: None,
+            loaded_frames: Vec::new(),
+            assignment_request: None,
             canvas: crate::balloon::AsciiSprite::new(side, side),
             ghost: None,
             frames: Vec::new(),
@@ -1682,7 +1809,7 @@ impl EditorState {
             grass: Vec::new(),
             decorations: Vec::new(),
             assign_assets: Vec::new(),
-            assignments: crate::config::AssignmentsConfig::default(),
+            assignments: cfg.assignments.clone(),
             slot_scroll: 0,
             asset_scroll: 0,
             undo: UndoStack::new(),
@@ -1882,9 +2009,12 @@ impl EditorState {
     /// True when the dropdown at `index` reacts to input.
     ///
     /// Dropdowns 2 and 3 are inactive while a balloon is selected
-    /// (roadmap §5.3): a balloon has one frame and no duck size. In
-    /// **strip mode** every dropdown is inert: the kind, the size and the
-    /// frame count belong to the drawing, and the strip is not a drawing.
+    /// (roadmap §5.3): a balloon has one frame and no duck size. The
+    /// element picker (dropdown 4) is live for a sprite, a balloon and a
+    /// decoration — the things the parade carries in numbered slots — and
+    /// dead for a grass tile, of which there is one. In **strip mode**
+    /// every dropdown is inert: the kind, the size and the frame count
+    /// belong to the drawing, and the strip is not a drawing.
     pub fn dropdown_enabled(&self, index: usize) -> bool {
         if self.mode == EditorMode::Sequencer {
             return false;
@@ -1896,6 +2026,12 @@ impl EditorState {
             1 | 2 => matches!(
                 self.kind,
                 crate::drawn::DrawnKind::Sprite | crate::drawn::DrawnKind::Decoration
+            ),
+            3 => matches!(
+                self.kind,
+                crate::drawn::DrawnKind::Sprite
+                    | crate::drawn::DrawnKind::Balloon
+                    | crate::drawn::DrawnKind::Decoration
             ),
             _ => false,
         }
@@ -1916,6 +2052,7 @@ impl EditorState {
                 crate::drawn::DrawnSize::Small => "SML",
             },
             2 => FRAME_LABELS[self.frames_wanted.clamp(1, 4) - 1],
+            3 => ELEMENT_NUMBER_LABELS[self.element_number.clamp(1, 11) - 1],
             _ => "",
         }
     }
@@ -1935,17 +2072,53 @@ impl EditorState {
                 crate::drawn::DrawnSize::Small => "SMALL",
             },
             2 => FRAME_LONGS[self.frames_wanted.clamp(1, 4) - 1],
+            3 => self.element_long(),
             _ => "",
         }
     }
 
+    /// The long form of the element picker's current value: which parade
+    /// duck, balloon or decoration the canvas is editing.
+    fn element_long(&self) -> &'static str {
+        match self.kind {
+            crate::drawn::DrawnKind::Sprite => {
+                ELEMENT_DUCK_LONGS[self.element_number.clamp(1, 11) - 1]
+            }
+            crate::drawn::DrawnKind::Balloon => {
+                ELEMENT_BALLOON_LONGS[self.element_number.clamp(1, 5) - 1]
+            }
+            crate::drawn::DrawnKind::Decoration => {
+                ELEMENT_DECO_LONGS[self.element_number.clamp(1, 2) - 1]
+            }
+            crate::drawn::DrawnKind::Grass => "",
+        }
+    }
+
     /// The options of the dropdown at `index`, in list order.
+    ///
+    /// The element picker's options are the **parade's numbering**: big
+    /// ducks 1-2, small ducks 3-11, balloons 1-5, decorations 1-2. The
+    /// list follows the kind and the size, so it is not a static slice.
     pub fn dropdown_options(&self, index: usize) -> &'static [&'static str] {
         match index {
             0 => &["BAL", "SPR", "GRS", "DEC"],
             1 => &["BIG", "SML"],
             2 => &["1", "2", "3", "4"],
+            3 => self.element_options(),
             _ => &[],
+        }
+    }
+
+    /// The element picker's options for the current kind and size.
+    fn element_options(&self) -> &'static [&'static str] {
+        match self.kind {
+            crate::drawn::DrawnKind::Sprite => match self.size {
+                crate::drawn::DrawnSize::Big => &ELEMENT_BIG_OPTIONS,
+                crate::drawn::DrawnSize::Small => &ELEMENT_SMALL_OPTIONS,
+            },
+            crate::drawn::DrawnKind::Balloon => &BALLOON_NUMBER_OPTIONS,
+            crate::drawn::DrawnKind::Decoration => &DECO_NUMBER_OPTIONS,
+            crate::drawn::DrawnKind::Grass => &[],
         }
     }
 
@@ -1963,7 +2136,21 @@ impl EditorState {
                 crate::drawn::DrawnSize::Small => 1,
             },
             2 => self.frames_wanted.clamp(1, 4) - 1,
+            3 => self.element_option_index(),
             _ => 0,
+        }
+    }
+
+    /// Which picker option is the current element number.
+    fn element_option_index(&self) -> usize {
+        match self.kind {
+            crate::drawn::DrawnKind::Sprite => match self.size {
+                crate::drawn::DrawnSize::Big => self.element_number.clamp(1, 2) - 1,
+                crate::drawn::DrawnSize::Small => self.element_number.clamp(3, 11) - 3,
+            },
+            crate::drawn::DrawnKind::Balloon => self.element_number.clamp(1, 5) - 1,
+            crate::drawn::DrawnKind::Decoration => self.element_number.clamp(1, 2) - 1,
+            crate::drawn::DrawnKind::Grass => 0,
         }
     }
 
@@ -1979,6 +2166,10 @@ impl EditorState {
         if kind != crate::drawn::DrawnKind::Sprite {
             self.frames_wanted = 1;
         }
+        // The element picker follows the kind: the new kind's first slot
+        // (a big duck is duck 1, a small duck duck 3, a deco follows its
+        // size). `reset_canvas` below clears the loaded document with it.
+        self.element_number = first_element_number(kind, self.size);
         // The asset name follows the kind: a balloon is not a sprite, and
         // a grass tile is neither (`grass-1`, `grass-2`, …).
         let default_name = self.next_free_name(kind);
@@ -1995,6 +2186,9 @@ impl EditorState {
     /// the status line says so.
     pub fn set_size(&mut self, size: crate::drawn::DrawnSize) {
         self.size = size;
+        // The picker follows the size: a big duck is duck 1, a small duck
+        // duck 3, a deco's slot is its size (1 big, 2 small).
+        self.element_number = first_element_number(self.kind, size);
         self.reset_canvas();
         self.set_toast("CANVAS CLEARED - NEW GRID");
         self.refresh_status();
@@ -2058,6 +2252,7 @@ impl EditorState {
             0 => self.pick_kind(option),
             1 => self.pick_size(option),
             2 => self.set_frames(option + 1),
+            3 => self.pick_element(option),
             _ => {}
         }
     }
@@ -2081,6 +2276,143 @@ impl EditorState {
             return;
         }
         self.set_size(size);
+    }
+
+    /// Apply the element picker (dropdown 4): point the editor at the
+    /// picked parade slot (2026-11-12 user decision).
+    ///
+    /// A slot that carries an assignment has **that document loaded for
+    /// editing** — the canvas, the frames, the name; saving writes the
+    /// document back under its own name and re-assigns the slot. An
+    /// unassigned slot starts a fresh document, like the picker was
+    /// never there. Re-picking the slot the editor already holds
+    /// **untouched** changes nothing; re-picking it over unsaved work
+    /// reloads the slot (an explicit discard).
+    pub fn pick_element(&mut self, option: usize) {
+        let load = self.platform.load_asset;
+        self.pick_element_with(option, move |kind, name| {
+            load.and_then(|load| load(kind, name).ok())
+        });
+    }
+
+    /// [`EditorState::pick_element`] with an **injectable** loader — the
+    /// test seam, so the tests never read the user's asset folder. The
+    /// web front end injects its in-memory store the same way.
+    pub fn pick_element_with<L>(&mut self, option: usize, loader: L)
+    where
+        L: FnOnce(crate::drawn::DrawnKind, &str) -> Option<crate::drawn::DrawnSprite>,
+    {
+        if !self.dropdown_enabled(3) {
+            return;
+        }
+        if option >= self.dropdown_options(3).len() {
+            return;
+        }
+        let (kind, size, number) = element_target(self.kind, self.size, option);
+        if (kind, size, number) == (self.kind, self.size, self.element_number) {
+            // Re-picking the **current** slot still loads it — the editor
+            // starts on duck 1 without any document, and the pick is the
+            // only way to bring its assigned art in (2026-11-12). It is a
+            // no-op only when this slot's document is already what the
+            // editor holds and the canvas is untouched: nothing to load,
+            // nothing to discard.
+            let assigned = self.assigned_element_name();
+            // `draft_dirty` is the "untouched" signal for both shapes: a
+            // fresh canvas (never painted) and a loaded document the user
+            // has not edited yet. Either way the pick has nothing to load
+            // and nothing to discard.
+            let clean = self.editing.as_deref() == assigned.as_deref() && !self.draft_dirty;
+            if clean {
+                return;
+            }
+        }
+        self.kind = kind;
+        self.size = size;
+        self.element_number = number;
+        self.reset_canvas();
+        let assigned = self.assigned_element_name();
+        match assigned.and_then(|name| loader(kind, &name).map(|doc| (name, doc))) {
+            Some((name, doc)) => self.load_document(&doc, &name),
+            None => {
+                self.editing = None;
+                self.name.clear();
+                self.default_name = self.next_free_name(kind);
+                let label = self.element_long();
+                self.set_toast(&format!("{label} - EMPTY"));
+            }
+        }
+        self.refresh_status();
+    }
+
+    /// The document name the picker's slot is assigned to, if any.
+    ///
+    /// The parade ducks and balloons come from the `[assignments]` table,
+    /// the decorations from their own two keys — the same shelves the
+    /// assign panel writes.
+    fn assigned_element_name(&self) -> Option<String> {
+        match self.kind {
+            crate::drawn::DrawnKind::Sprite => match self.size {
+                crate::drawn::DrawnSize::Big => self
+                    .assignments
+                    .big(self.element_number)
+                    .map(str::to_string),
+                crate::drawn::DrawnSize::Small => self
+                    .assignments
+                    .small(self.element_number.saturating_sub(2).max(1))
+                    .map(str::to_string),
+            },
+            crate::drawn::DrawnKind::Balloon => self
+                .assignments
+                .balloon(self.element_number)
+                .map(str::to_string),
+            crate::drawn::DrawnKind::Decoration => {
+                let deco = &self.settings_config.decorations;
+                let slot = if self.size == crate::drawn::DrawnSize::Big {
+                    &deco.big
+                } else {
+                    &deco.small
+                };
+                slot.clone()
+            }
+            crate::drawn::DrawnKind::Grass => None,
+        }
+    }
+
+    /// Put a saved document on the canvas for editing in place.
+    ///
+    /// The document's frames are **cropped** (the save crops them to the
+    /// active region), the canvas is the authoring grid — so frame 0 is
+    /// stamped into the canvas at the top-left corner and frames 1.. go
+    /// into [`EditorState::loaded_frames`], for
+    /// [`EditorState::advance_frame`] to serve one by one. The name field
+    /// carries the document's own name: saving writes it back under that
+    /// name ([`EditorState::editing`]).
+    fn load_document(&mut self, doc: &crate::drawn::DrawnSprite, name: &str) {
+        self.frames_wanted = doc.frames.len().clamp(1, 4);
+        self.frame_index = 0;
+        let mut frames = doc.frames.iter();
+        if let Some(first) = frames.next() {
+            stamp_frame(&mut self.canvas, first);
+        }
+        self.loaded_frames = frames.cloned().collect();
+        self.editing = Some(name.to_string());
+        self.name = name.to_string();
+        self.default_name = name.to_string();
+        // The loaded asset replaces the previous drawing, draft
+        // bookkeeping included: a draft of the old drawing is deleted,
+        // exactly like a rename would (audit 101126 §B1).
+        if let Some((old_kind, old_name)) = self.draft_key.take() {
+            if old_kind != self.kind || old_name != name {
+                self.draft_actions.push(DraftAction::Delete {
+                    kind: old_kind,
+                    name: old_name,
+                });
+            }
+        }
+        self.draft_offer = None;
+        self.draft_dirty = false;
+        self.draft_due = None;
+        self.set_toast(&format!("EDITING {}", name.to_uppercase()));
     }
 
     /// Append a character to the name field.
@@ -2899,6 +3231,13 @@ impl EditorState {
         self.frames.push(frame);
         let (cols, rows) = self.drawing_canvas_size();
         self.canvas = crate::balloon::AsciiSprite::new(cols, rows);
+        // A **loaded** document serves its own next frame, so editing a
+        // multi-frame asset walks its poses in order instead of rebuilding
+        // them from blank canvases (2026-11-12 element picker).
+        if !self.loaded_frames.is_empty() {
+            let next = self.loaded_frames.remove(0);
+            stamp_frame(&mut self.canvas, &next);
+        }
         self.frame_index += 1;
         self.undo.clear();
         self.stroke = None;
@@ -2924,13 +3263,18 @@ impl EditorState {
     {
         let kind = self.kind;
         let name = self.save_name();
-        if exists(kind, name.as_str()) {
+        // The picker's **loaded** document may be overwritten: editing in
+        // place is its whole point. Every other existing name is refused,
+        // as always (roadmap §5.6).
+        let loaded = self.editing.as_deref();
+        if exists(kind, name.as_str()) && loaded != Some(name.as_str()) {
             self.set_toast_at(NAME_IN_USE, now);
             return;
         }
         let document = self.document();
         match save(&document, kind, name.as_str()) {
             Ok(_) => {
+                self.stage_the_picker_assignment(&name);
                 // The asset is on disk, so the draft has done its job:
                 // saving the asset deletes the draft (roadmap Extension 2
                 // §2.2). A draft written under a **renamed** asset leaves
@@ -2956,6 +3300,40 @@ impl EditorState {
             Err(e) => self.set_toast_at(&format!("SAVE FAILED: {e}"), now),
         }
         self.refresh_status();
+    }
+
+    /// Point the element picker's slot at the document that was just
+    /// saved (2026-11-12 element picker).
+    ///
+    /// Editing a parade slot in place ends in the slot showing the edit:
+    /// the save records the assignment in the state's own copy — the
+    /// assign panel's **write-first** rule — and stages the config write
+    /// in [`EditorState::assignment_request`] for the application half
+    /// to carry out. A decoration has its own two keys, not a table row;
+    /// a grass tile has no slot at all.
+    fn stage_the_picker_assignment(&mut self, name: &str) {
+        match element_slot(self.kind, self.size, self.element_number) {
+            Some(slot) => {
+                let mut table = self.assignments.clone();
+                table.set(slot, Some(name.to_string()));
+                self.assignment_request = Some(AssignWrite::Assignments(Box::new(table.clone())));
+                self.assignments = table;
+            }
+            None if self.kind == crate::drawn::DrawnKind::Decoration => {
+                let (key, field) = if self.size == crate::drawn::DrawnSize::Big {
+                    ("big", &mut self.settings_config.decorations.big)
+                } else {
+                    ("small", &mut self.settings_config.decorations.small)
+                };
+                *field = Some(name.to_string());
+                self.assignment_request = Some(AssignWrite::Key {
+                    section: "decorations",
+                    key,
+                    value: toml::Value::String(name.to_string()).to_string(),
+                });
+            }
+            None => {}
+        }
     }
 
     /// The document the current drawing is stored as.
@@ -3074,9 +3452,10 @@ impl EditorState {
                 // names the tile, its size and the caps it must respect.
                 crate::drawn::DrawnKind::Grass => grass_status_full(&self.grass_tile()),
                 _ => format!(
-                    "TYPE: {}  {}  {}  FRAME {}/{}  {}  {}",
+                    "TYPE: {}  {}  {}  {}  FRAME {}/{}  {}  {}",
                     self.dropdown_long(0),
                     self.size_label(),
+                    self.dropdown_long(3),
                     self.dropdown_long(2),
                     self.frame_index + 1,
                     self.frames_wanted,
@@ -3108,6 +3487,8 @@ impl EditorState {
         let (cols, rows) = self.drawing_canvas_size();
         self.canvas = crate::balloon::AsciiSprite::new(cols, rows);
         self.frames.clear();
+        self.loaded_frames.clear();
+        self.editing = None;
         self.ghost = None;
         self.frame_index = 0;
         self.scroll_rows = 0;
@@ -4676,8 +5057,17 @@ pub fn assignment_slots() -> Vec<crate::config::AssignmentSlot> {
 }
 
 /// The label of a slot: `BIG 1`, `SMALL 3`, `BALLOON 5`.
+///
+/// The small ducks carry the **parade's** numbering (2026-11-12 user
+/// report): config key `small_1` is parade duck 3, `small_9` is duck 11
+/// — the two big ducks are ducks 1 and 2, and the list reads like the
+/// train. The config keys themselves are untouched.
 pub fn slot_label(slot: &crate::config::AssignmentSlot) -> String {
-    format!("{} {}", slot_kind_label(slot.kind), slot.number)
+    let number = match slot.kind {
+        crate::config::SlotKind::Small => slot.number + 2,
+        _ => slot.number,
+    };
+    format!("{} {}", slot_kind_label(slot.kind), number)
 }
 
 /// The first free asset name of `kind`, without the platform.
@@ -4716,6 +5106,90 @@ fn save_asset_document(
             path: PathBuf::new(),
             source: std::io::Error::other("no asset folder was injected"),
         }),
+    }
+}
+
+/// The first element number of a kind and size: the parade's own
+/// numbering — duck 1 for a big sprite, duck 3 for a small one, deco 1
+/// or 2 by size, balloon 1 (2026-11-12 element picker).
+fn first_element_number(kind: crate::drawn::DrawnKind, size: crate::drawn::DrawnSize) -> usize {
+    match kind {
+        crate::drawn::DrawnKind::Sprite if size == crate::drawn::DrawnSize::Small => 3,
+        crate::drawn::DrawnKind::Decoration if size == crate::drawn::DrawnSize::Small => 2,
+        _ => 1,
+    }
+}
+
+/// The element the picker `option` names, for the current kind and size:
+/// `(kind, size, parade number)`.
+///
+/// The parade numbering (2026-11-12 user report): big ducks are ducks 1
+/// and 2, small ducks 3 to 11, balloons 1 to 5. A decoration's slot 1 is
+/// the big duck's, slot 2 the small duck's — picking it also picks the
+/// size, because the deco's frame is the duck's.
+fn element_target(
+    kind: crate::drawn::DrawnKind,
+    size: crate::drawn::DrawnSize,
+    option: usize,
+) -> (crate::drawn::DrawnKind, crate::drawn::DrawnSize, usize) {
+    match kind {
+        crate::drawn::DrawnKind::Sprite => match size {
+            crate::drawn::DrawnSize::Big => (kind, size, option + 1),
+            crate::drawn::DrawnSize::Small => (kind, size, option + 3),
+        },
+        crate::drawn::DrawnKind::Balloon => (kind, size, option + 1),
+        crate::drawn::DrawnKind::Decoration => (
+            kind,
+            if option == 0 {
+                crate::drawn::DrawnSize::Big
+            } else {
+                crate::drawn::DrawnSize::Small
+            },
+            option + 1,
+        ),
+        crate::drawn::DrawnKind::Grass => (kind, size, 1),
+    }
+}
+
+/// The parade slot the picker's current element points at, if the kind
+/// has one — a grass tile has none. This is what a completed save
+/// assigns: the slot shows the document that was just written.
+fn element_slot(
+    kind: crate::drawn::DrawnKind,
+    size: crate::drawn::DrawnSize,
+    number: usize,
+) -> Option<crate::config::AssignmentSlot> {
+    let slot_kind = match kind {
+        crate::drawn::DrawnKind::Sprite if size == crate::drawn::DrawnSize::Big => {
+            crate::config::SlotKind::Big
+        }
+        crate::drawn::DrawnKind::Sprite => crate::config::SlotKind::Small,
+        crate::drawn::DrawnKind::Balloon => crate::config::SlotKind::Balloon,
+        _ => return None,
+    };
+    let config_number = match slot_kind {
+        crate::config::SlotKind::Small => number.saturating_sub(2).max(1),
+        _ => number,
+    };
+    Some(crate::config::AssignmentSlot {
+        kind: slot_kind,
+        number: config_number,
+    })
+}
+
+/// Stamp a saved frame into the authoring canvas at the top-left corner.
+///
+/// A saved frame is **cropped** (to the active region, or to a grass
+/// tile's ink), the canvas is the full authoring grid;
+/// [`crate::balloon::AsciiSprite::set`] clips what does not fit.
+fn stamp_frame(canvas: &mut crate::balloon::AsciiSprite, frame: &crate::balloon::AsciiSprite) {
+    for (index, (&ch, &color)) in frame.chars().iter().zip(frame.colors()).enumerate() {
+        if ch == ' ' {
+            continue;
+        }
+        let col = index % frame.cols();
+        let row = index / frame.cols();
+        canvas.set(col, row, ch, color);
     }
 }
 
@@ -4919,7 +5393,7 @@ fn panel_cells(mode: EditorMode) -> u32 {
 /// What a click at a pixel lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorHit {
-    /// A dropdown box (0 = kind, 1 = size, 2 = frames).
+    /// A dropdown box (0 = kind, 1 = size, 2 = frames, 3 = element).
     Dropdown(usize),
     /// An option of the open dropdown's list.
     DropdownOption { dropdown: usize, option: usize },
@@ -5489,12 +5963,12 @@ pub fn paint_overlay(grid: &mut crate::grid::Grid, layout: &EditorLayout, state:
 
 /// Paint the caption that stands in for the dropdown boxes in strip mode.
 ///
-/// The three dropdown boxes belong to the drawing; the strip has no
-/// kind, no size and no frame count, so the top bar carries the name of
-/// the mode instead of an empty gap.
+/// The four dropdown boxes belong to the drawing; the strip has no
+/// kind, no size, no frame count and no element, so the top bar carries
+/// the name of the mode instead of an empty gap.
 fn paint_strip_caption(grid: &mut crate::grid::Grid, layout: &EditorLayout) {
     let first = layout.dropdowns[0];
-    let last = layout.dropdowns[2];
+    let last = layout.dropdowns[3];
     let area = Rect::new(first.x, first.y, (last.right() - first.x) as u32, first.h);
     let width = crate::hud_font::text_width(STRIP_CAPTION);
     let box_width = i64::from(area.w) / i64::from(UI_CELL_W);
@@ -5828,18 +6302,95 @@ fn fit_base_text(text: &str, cells: i64) -> String {
     format!("{cut}-")
 }
 
+/// The glyph of the canvas' grid dots. One dot where every second pair
+/// of cells meets, so the cell grid is legible without turning the
+/// canvas into graph paper (2026-11-12 user report).
+const CANVAS_DOT_GLYPH: char = '.';
+
+/// The colour of the canvas' outline: the muted grey at **full**
+/// strength. The outline must be visible — "impossible to see where to
+/// draw and if it's even open for drawing" was the report that asked
+/// for it — while staying clearly not-art.
+const CANVAS_OUTLINE_COLOR: [u8; 3] = UI_MUTED;
+
+/// The colour of the canvas' grid dots: half the muted grey. Fainter
+/// than the outline — the dots announce the grid, the drawing stays
+/// dominant.
+const CANVAS_DOT_COLOR: [u8; 3] = [64, 64, 64];
+
 /// Paint the canvas' visible cells into the base layer.
 ///
-/// The **ghost** goes down first and the current frame on top of it, so
-/// a cell painted in the current frame hides the ghost underneath it
-/// (roadmap §5.6). Only the **active** region is drawn: an inactive
-/// cell stays transparent, so the canvas reads as one clean shape with
-/// no border and no dimming (decision D18). The rows above the scroll
-/// and the columns left of the horizontal scroll are skipped; the cells
-/// below and right of the viewport are dropped by the grid itself.
+/// The **chrome** goes down first (the outline and the grid dots), the
+/// **ghost** on top of it and the current frame last, so a cell painted
+/// in the current frame hides everything underneath it (roadmap §5.6).
+/// Only the **active** region carries art: an inactive cell stays
+/// transparent, so the canvas reads as one clean shape with no dimming
+/// (decision D18) — the outline and the dots are the canvas' chrome,
+/// never part of the art. The rows above the scroll and the columns
+/// left of the horizontal scroll are skipped; the cells below and right
+/// of the viewport are dropped by the grid itself.
 fn paint_canvas(grid: &mut crate::grid::Grid, layout: &EditorLayout, state: &EditorState) {
+    paint_canvas_chrome(grid, layout, state);
     paint_ghost(grid, layout, state);
     paint_current_frame(grid, layout, state);
+}
+
+/// The canvas' chrome: the outline of the drawable region and the grid
+/// dots (2026-11-12 user report).
+///
+/// The outline traces the **active** region — a sprite's frame rows,
+/// the balloon's disc bounding box, the grass tile's band — and the
+/// dots land only on **active** cells, so a balloon's corners carry no
+/// dot. The outline is drawn after the dots, so its corners (`+`)
+/// overwrite them.
+fn paint_canvas_chrome(grid: &mut crate::grid::Grid, layout: &EditorLayout, state: &EditorState) {
+    let cols = state.canvas_cols();
+    let rows = state.active_rows();
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let right = cols - 1;
+    let bottom = rows - 1;
+    for index in 0..cols * rows {
+        let col = index % cols;
+        let row = index / cols;
+        if !col.is_multiple_of(2) || !row.is_multiple_of(2) || !state.cell_is_active(col, row) {
+            continue;
+        }
+        paint_chrome_cell(grid, layout, col, row, CANVAS_DOT_GLYPH, CANVAS_DOT_COLOR);
+    }
+    for row in 0..rows {
+        paint_chrome_cell(grid, layout, 0, row, '|', CANVAS_OUTLINE_COLOR);
+        paint_chrome_cell(grid, layout, right, row, '|', CANVAS_OUTLINE_COLOR);
+    }
+    for col in 0..cols {
+        let glyph = if col == 0 || col == right { '+' } else { '-' };
+        paint_chrome_cell(grid, layout, col, 0, glyph, CANVAS_OUTLINE_COLOR);
+        paint_chrome_cell(grid, layout, col, bottom, glyph, CANVAS_OUTLINE_COLOR);
+    }
+}
+
+/// One chrome cell of the canvas, mapped through the scroll and the
+/// viewport like the art is; out-of-view cells are dropped.
+fn paint_chrome_cell(
+    grid: &mut crate::grid::Grid,
+    layout: &EditorLayout,
+    col: usize,
+    row: usize,
+    ch: char,
+    color: [u8; 3],
+) {
+    let col0 = layout.canvas.x / i64::from(CANVAS_CELL_W);
+    let row0 = layout.canvas.y / i64::from(CANVAS_CELL_H);
+    if !column_in_view(col, layout.canvas_scroll_cols, layout.canvas_view_cols) {
+        return;
+    }
+    if row < layout.canvas_scroll_rows {
+        return;
+    }
+    let target_col = col0 + (col - layout.canvas_scroll_cols) as i64;
+    let target_row = row0 + (row - layout.canvas_scroll_rows) as i64;
+    grid.set_if_visible(target_col, target_row, ch, color);
 }
 
 /// Paint the ghost — the previous frame at 20 % brightness.
@@ -6396,10 +6947,27 @@ pub fn status_text(state: &EditorState, layout: &EditorLayout) -> String {
     if block_font_width(&full) <= cols {
         return full;
     }
+    // The ladder below the full line trades detail for width. The
+    // **element** survives longer than the size: which duck the canvas is
+    // editing is what the user can mis-set, and the picker's number
+    // implies the size anyway (ducks 1-2 are the big ones).
+    let wide = format!(
+        "TYPE: {}  {}  {}  FRAME {}/{}  {}  {}",
+        state.dropdown_long(0),
+        state.size_label(),
+        state.dropdown_long(3),
+        state.frame_index + 1,
+        state.frames_wanted,
+        tool_label(state.tool),
+        colour_label(state.color),
+    );
+    if block_font_width(&wide) <= cols {
+        return wide;
+    }
     let medium = format!(
         "TYPE: {}  {}  FRAME {}/{}  {}  {}",
         state.dropdown_long(0),
-        state.size_label(),
+        state.dropdown_long(3),
         state.frame_index + 1,
         state.frames_wanted,
         tool_label(state.tool),
@@ -7026,18 +7594,26 @@ mod tests {
         let state = state();
         // The long form fits the default window and names everything.
         let full = status_text(&state, &layout(1536, 864, &state));
-        assert!(full.contains("BIG"), "{full}");
-        assert!(full.contains("STATIC"), "{full}");
+        assert!(full.contains("DUCK 1"), "{full}");
+        assert!(full.contains("X"), "{full}");
         assert!(full.contains("WHITE"), "{full}");
+        // A wide window also names the size and the frame count.
+        let wide = status_text(&state, &layout(2048, 1024, &state));
+        assert!(wide.contains("BIG"), "{wide}");
+        assert!(wide.contains("DUCK 1"), "{wide}");
+        assert!(wide.contains("STATIC"), "{wide}");
         // The widths are **measured**, not guessed: the status line
         // falls back one form at a time, and the window that shows each
         // form is the width that form needs.
-        let medium_form = "TYPE: SPRITE  BIG  FRAME 1/1  X  WHITE";
+        let medium_form = "TYPE: SPRITE  DUCK 1  FRAME 1/1  X  WHITE";
         let compact_form = "TYPE: SPRITE  FRAME 1/1  X  WHITE";
-        // A window that fits the medium form but not the long one.
+        // A window that fits the medium form but not the long one. The
+        // medium form keeps the **element** (which duck the canvas is
+        // editing) and drops the size — the picker's number implies it
+        // (ducks 1-2 are the big ones).
         let cols = block_font_width(medium_form);
         let medium = status_text(&state, &layout(window_of(cols), 864, &state));
-        assert!(medium.contains("BIG"), "{medium}");
+        assert!(medium.contains("DUCK 1"), "{medium}");
         assert!(medium.contains("X"), "{medium}");
         assert!(!medium.contains("STATIC"), "{medium}");
         // A window that fits the compact form but not the medium one.
@@ -7099,15 +7675,15 @@ mod tests {
         };
         table.set(slot, Some("cat".to_string()));
         state.enter_assign_mode_with(vec![asset("cat", DrawnSize::Small)], vec![], table);
-        state.select_target(slot_index(&state, "SMALL 3"));
+        state.select_target(slot_index(&state, "SMALL 5"));
         let text = assign_status_text(&state, 256);
-        assert_eq!(text, "ASSIGN: SMALL 3 = CAT");
+        assert_eq!(text, "ASSIGN: SMALL 5 = CAT");
         // The block font carries no `=`, so the line draws the dash the
         // font does carry — exactly like the toast does.
-        assert_eq!(block_font_text(&text), "ASSIGN: SMALL 3 - CAT");
+        assert_eq!(block_font_text(&text), "ASSIGN: SMALL 5 - CAT");
         assert_eq!(
-            block_font_text("ASSIGNED SMALL 3 = CAT"),
-            "ASSIGNED SMALL 3 - CAT"
+            block_font_text("ASSIGNED SMALL 5 = CAT"),
+            "ASSIGNED SMALL 5 - CAT"
         );
         // The width is measured with the dash, so the line still fits.
         assert!(block_font_width(&text) <= 256);
@@ -7213,13 +7789,14 @@ mod tests {
             region_has_ink(&fb, 0, layout.status.y as u32, w, layout.status.h),
             "the status line must be drawn"
         );
-        // The empty canvas stays black: the inactive area is invisible
-        // (decision D18) and an empty canvas has no ink at all. The
-        // region is the canvas only — the tool panel to its right
+        // The empty canvas carries the **chrome** now: the outline and
+        // the grid dots announce the drawable region (2026-11-12 user
+        // report — a black canvas on a black page hid where to draw).
+        // The region is the canvas only — the tool panel to its right
         // carries the 19 tools and the 8 colours.
         assert!(
-            !region_has_ink(&fb, 0, layout.canvas.y as u32 + 200, layout.canvas.w, 200),
-            "the empty canvas must stay black"
+            region_has_ink(&fb, 0, layout.canvas.y as u32 + 200, layout.canvas.w, 200),
+            "the empty canvas shows its outline and grid dots"
         );
         // A PNG proof for the eye. It goes into this test's own temp
         // folder (never a fixed name in the shared temp dir) and is
@@ -7255,6 +7832,90 @@ mod tests {
             None,
             "an inactive cell must stay invisible"
         );
+    }
+
+    #[test]
+    fn the_canvas_carries_an_outline_and_grid_dots() {
+        let state = state();
+        // A window that shows the whole big sprite canvas — a smaller one
+        // scrolls, and the scrolled-out chrome is dropped by design.
+        let layout = layout(3072, 1920, &state);
+        let mut grid = base_grid(3072, 1920);
+        paint_base(&mut grid, &layout, &state);
+        let col0 = (layout.canvas.x / i64::from(CANVAS_CELL_W)) as usize;
+        let row0 = (layout.canvas.y / i64::from(CANVAS_CELL_H)) as usize;
+        // The corners are `+`, the edges `-` and `|`.
+        assert_eq!(grid.char_at(col0, row0), Some('+'), "the top-left corner");
+        assert_eq!(
+            grid.char_at(col0 + 149, row0),
+            Some('+'),
+            "the top-right corner"
+        );
+        assert_eq!(grid.char_at(col0 + 75, row0), Some('-'), "the top edge");
+        assert_eq!(
+            grid.char_at(col0, row0 + 69),
+            Some('+'),
+            "the frame's bottom-left corner"
+        );
+        assert_eq!(
+            grid.char_at(col0 + 40, row0 + 69),
+            Some('-'),
+            "the frame's bottom edge"
+        );
+        assert_eq!(
+            grid.char_at(col0 + 149, row0 + 30),
+            Some('|'),
+            "the right edge"
+        );
+        // The dots sit where every second pair of cells meets.
+        assert_eq!(grid.char_at(col0 + 40, row0 + 40), Some('.'));
+        assert_eq!(
+            grid.char_at(col0 + 41, row0 + 40),
+            Some(' '),
+            "odd column: no dot"
+        );
+        assert_eq!(
+            grid.char_at(col0 + 40, row0 + 41),
+            Some(' '),
+            "odd row: no dot"
+        );
+        // The rows below the frame carry nothing: no chrome, no art
+        // (decision D18 — the inactive region stays transparent).
+        assert_eq!(grid.char_at(col0 + 40, row0 + 70), Some(' '));
+    }
+
+    #[test]
+    fn the_chrome_never_covers_the_art() {
+        let mut state = state();
+        state.canvas.set(40, 40, 'x', crate::drawn::PALETTE[1]);
+        let layout = layout(3072, 1920, &state);
+        let mut grid = base_grid(3072, 1920);
+        paint_base(&mut grid, &layout, &state);
+        let col0 = (layout.canvas.x / i64::from(CANVAS_CELL_W)) as usize;
+        let row0 = (layout.canvas.y / i64::from(CANVAS_CELL_H)) as usize;
+        assert_eq!(grid.char_at(col0 + 40, row0 + 40), Some('x'));
+        assert_eq!(
+            grid.color_at(col0 + 40, row0 + 40),
+            Some(crate::drawn::PALETTE[1])
+        );
+    }
+
+    #[test]
+    fn the_balloon_dots_follow_the_disc() {
+        let mut state = state();
+        state.set_kind(crate::drawn::DrawnKind::Balloon);
+        let layout = layout(3072, 1920, &state);
+        let mut grid = base_grid(3072, 1920);
+        paint_base(&mut grid, &layout, &state);
+        let col0 = (layout.canvas.x / i64::from(CANVAS_CELL_W)) as usize;
+        let row0 = (layout.canvas.y / i64::from(CANVAS_CELL_H)) as usize;
+        // The outline traces the disc's **bounding box** (109 x 73).
+        assert_eq!(grid.char_at(col0, row0), Some('+'));
+        assert_eq!(grid.char_at(col0 + 108, row0 + 72), Some('+'));
+        // The disc's centre is an even-even cell: a dot.
+        assert_eq!(grid.char_at(col0 + 54, row0 + 36), Some('.'));
+        // A corner of the box is outside the disc: no dot, no art.
+        assert_eq!(grid.char_at(col0 + 2, row0 + 2), Some(' '));
     }
 
     #[test]
@@ -7576,6 +8237,288 @@ mod tests {
                 option: 1
             },
             "a closed list is not a hit"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The element picker (dropdown 4) — 2026-11-12
+    // -----------------------------------------------------------------
+
+    /// A one-frame balloon document, for the picker's loader seam.
+    fn balloon_document(ink: char) -> crate::drawn::DrawnSprite {
+        let mut frame = crate::balloon::AsciiSprite::new(109, 73);
+        frame.set(54, 36, ink, crate::drawn::PALETTE[1]);
+        crate::drawn::DrawnSprite {
+            kind: crate::drawn::DrawnKind::Balloon,
+            size: None,
+            frames: vec![frame],
+            reaction: None,
+        }
+    }
+
+    #[test]
+    fn the_element_picker_offers_the_parade_numbers() {
+        let mut state = state();
+        assert_eq!(
+            state.dropdown_options(3),
+            &["1", "2"],
+            "the big ducks are ducks 1 and 2"
+        );
+        state.set_size(crate::drawn::DrawnSize::Small);
+        assert_eq!(
+            state.dropdown_options(3),
+            &["3", "4", "5", "6", "7", "8", "9", "10", "11"],
+            "the small ducks are ducks 3 to 11"
+        );
+        state.set_kind(crate::drawn::DrawnKind::Balloon);
+        assert_eq!(state.dropdown_options(3), &["1", "2", "3", "4", "5"]);
+        state.set_kind(crate::drawn::DrawnKind::Decoration);
+        assert_eq!(state.dropdown_options(3), &["1", "2"]);
+        state.set_kind(crate::drawn::DrawnKind::Grass);
+        assert!(state.dropdown_options(3).is_empty());
+        assert!(
+            !state.dropdown_enabled(3),
+            "a grass tile has no picker: there is one tile"
+        );
+    }
+
+    #[test]
+    fn picking_a_slot_loads_the_assigned_document() {
+        let mut state = state();
+        let mut table = no_assignments();
+        table.set(
+            crate::config::AssignmentSlot {
+                kind: crate::config::SlotKind::Balloon,
+                number: 2,
+            },
+            Some("party".to_string()),
+        );
+        state.assignments = table;
+        state.set_kind(crate::drawn::DrawnKind::Balloon);
+        state.pick_element_with(1, |kind, name| {
+            assert!(matches!(kind, crate::drawn::DrawnKind::Balloon));
+            assert_eq!(name, "party");
+            Some(balloon_document('o'))
+        });
+        assert_eq!(state.editing.as_deref(), Some("party"));
+        assert_eq!(state.name, "party");
+        assert_eq!(state.element_number, 2);
+        assert_eq!(
+            state.canvas.get(54, 36),
+            Some(('o', crate::drawn::PALETTE[1])),
+            "the loaded frame is on the canvas"
+        );
+        let toast = state.active_toast().expect("a toast");
+        assert!(toast.starts_with("EDITING"), "{toast}");
+    }
+
+    #[test]
+    fn picking_an_empty_slot_starts_a_fresh_document() {
+        let mut state = state();
+        state.set_kind(crate::drawn::DrawnKind::Balloon);
+        state.pick_element_with(2, |_, _| Some(balloon_document('o')));
+        assert_eq!(state.editing, None, "balloon 3 is unassigned");
+        assert_eq!(state.kind, crate::drawn::DrawnKind::Balloon);
+        assert_eq!(state.element_number, 3);
+        assert_eq!(state.name, "");
+        assert_eq!(state.default_name, "balloon-1");
+        let toast = state.active_toast().expect("a toast");
+        assert!(toast.ends_with("- EMPTY"), "{toast}");
+    }
+
+    #[test]
+    fn picking_the_current_untouched_element_changes_nothing() {
+        let mut state = state();
+        let called = std::cell::Cell::new(false);
+        state.pick_element_with(0, |_, _| {
+            called.set(true);
+            None
+        });
+        assert!(!called.get(), "duck 1 is untouched: nothing to load");
+        assert_eq!(state.active_toast(), None, "and no toast says otherwise");
+    }
+
+    #[test]
+    fn repicking_the_current_slot_reloads_it_over_unsaved_work() {
+        let mut state = state();
+        let mut table = no_assignments();
+        table.set(
+            crate::config::AssignmentSlot {
+                kind: crate::config::SlotKind::Big,
+                number: 1,
+            },
+            Some("hero".to_string()),
+        );
+        state.assignments = table;
+        state.paint(3, 3);
+        state.pick_element_with(0, |_, _| {
+            Some(crate::drawn::DrawnSprite {
+                kind: crate::drawn::DrawnKind::Sprite,
+                size: Some(crate::drawn::DrawnSize::Big),
+                frames: Vec::new(),
+                reaction: None,
+            })
+        });
+        assert_eq!(state.editing.as_deref(), Some("hero"), "the pick reloads");
+        assert_eq!(
+            state.canvas.ink_count(),
+            0,
+            "the unsaved work was discarded"
+        );
+    }
+
+    #[test]
+    fn a_loaded_document_may_be_overwritten_and_stages_the_assignment() {
+        let mut state = state();
+        let mut table = no_assignments();
+        table.set(
+            crate::config::AssignmentSlot {
+                kind: crate::config::SlotKind::Balloon,
+                number: 2,
+            },
+            Some("party".to_string()),
+        );
+        state.assignments = table;
+        state.set_kind(crate::drawn::DrawnKind::Balloon);
+        state.pick_element_with(1, |_, _| Some(balloon_document('o')));
+        let mut saved = false;
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| true,
+            |_, _, _| {
+                saved = true;
+                Ok(std::path::PathBuf::from("x"))
+            },
+        );
+        assert!(saved, "editing in place overwrites the loaded name");
+        let toast = state.active_toast().unwrap_or("");
+        assert!(!toast.contains("IN USE"), "{toast}");
+        match state.assignment_request.take() {
+            Some(AssignWrite::Assignments(table)) => {
+                assert_eq!(table.balloon(2), Some("party"), "the slot was assigned");
+            }
+            other => panic!("the parade slots write the table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_small_duck_save_assigns_its_own_config_key() {
+        let mut state = state();
+        // Duck 4 is config key `small_2` — the parade numbering, not the
+        // key numbering (2026-11-12 user report).
+        state.set_size(crate::drawn::DrawnSize::Small);
+        state.pick_element_with(1, |_, _| None);
+        assert_eq!(state.element_number, 4);
+        let mut saved = false;
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| false,
+            |_, _, _| {
+                saved = true;
+                Ok(std::path::PathBuf::from("x"))
+            },
+        );
+        assert!(saved);
+        match state.assignment_request.take() {
+            Some(AssignWrite::Assignments(table)) => {
+                assert_eq!(table.small(2), Some("sprite-1"), "small_2 was assigned");
+                assert_eq!(
+                    state.assignments.small(2),
+                    Some("sprite-1"),
+                    "the state's copy carries the assignment too"
+                );
+            }
+            other => panic!("the parade slots write the table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn advance_frame_serves_the_loaded_frames() {
+        let mut state = state();
+        let mut table = no_assignments();
+        table.set(
+            crate::config::AssignmentSlot {
+                kind: crate::config::SlotKind::Big,
+                number: 1,
+            },
+            Some("hero".to_string()),
+        );
+        state.assignments = table;
+        let frame = |ink: char| {
+            let mut f = crate::balloon::AsciiSprite::new(150, 70);
+            f.set(10, 10, ink, crate::drawn::PALETTE[0]);
+            f
+        };
+        let doc = crate::drawn::DrawnSprite {
+            kind: crate::drawn::DrawnKind::Sprite,
+            size: Some(crate::drawn::DrawnSize::Big),
+            frames: vec![frame('a'), frame('b'), frame('c')],
+            reaction: None,
+        };
+        state.pick_element_with(0, |_, _| Some(doc));
+        assert_eq!(state.frames_wanted, 3);
+        assert_eq!(
+            state.canvas.get(10, 10),
+            Some(('a', crate::drawn::PALETTE[0]))
+        );
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| false,
+            |_, _, _| Ok(std::path::PathBuf::from("x")),
+        );
+        assert_eq!(
+            state.canvas.get(10, 10),
+            Some(('b', crate::drawn::PALETTE[0]))
+        );
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| false,
+            |_, _, _| Ok(std::path::PathBuf::from("x")),
+        );
+        assert_eq!(
+            state.canvas.get(10, 10),
+            Some(('c', crate::drawn::PALETTE[0]))
+        );
+        let saved: std::cell::RefCell<Option<crate::drawn::DrawnSprite>> =
+            std::cell::RefCell::new(None);
+        state.primary_action_with(
+            Instant::now(),
+            |_, _| false,
+            |doc, _, _| {
+                *saved.borrow_mut() = Some(doc.clone());
+                Ok(std::path::PathBuf::from("x"))
+            },
+        );
+        let doc = saved.into_inner().expect("the document was saved");
+        let inks: Vec<char> = doc
+            .frames
+            .iter()
+            .map(|frame| frame.get(10, 10).map(|(ch, _)| ch).unwrap_or(' '))
+            .collect();
+        assert_eq!(
+            inks,
+            vec!['a', 'b', 'c'],
+            "the loaded frames kept their order"
+        );
+    }
+
+    #[test]
+    fn the_fourth_dropdown_box_is_laid_out_and_fits_the_floor() {
+        let state = state();
+        let layout = layout(1536, 864, &state);
+        let boxes = &layout.dropdowns;
+        assert_eq!(boxes.len(), 4);
+        for pair in boxes.windows(2) {
+            assert!(pair[0].right() <= pair[1].x, "the boxes never overlap");
+        }
+        assert!(
+            layout.name_field.x >= boxes[3].right(),
+            "the name field starts after the picker"
+        );
+        assert!(
+            min_layout_width() <= 1366,
+            "the four-box floor must not cost the 1366 px screens ({} px)",
+            min_layout_width()
         );
     }
 
@@ -7943,8 +8886,10 @@ mod tests {
         let labels: Vec<String> = state.targets.iter().map(target_label).collect();
         assert_eq!(labels[0], "BIG 1");
         assert_eq!(labels[1], "BIG 2");
-        assert_eq!(labels[2], "SMALL 1");
-        assert_eq!(labels[10], "SMALL 9");
+        // The small ducks carry the **parade's** numbering: config key
+        // `small_1` is parade duck 3 (2026-11-12 user report).
+        assert_eq!(labels[2], "SMALL 3");
+        assert_eq!(labels[10], "SMALL 11");
         assert_eq!(labels[11], "BALLOON 1");
         assert_eq!(labels[15], "BALLOON 5");
         assert_eq!(labels[16], "GRASS");
@@ -7972,11 +8917,11 @@ mod tests {
         // A small duck takes the **small** sprites: the size class is
         // the filter, so a small sprite can never land in a big slot
         // (audit 2026-10-21 §E1).
-        state.select_target(slot_index(&state, "SMALL 1"));
+        state.select_target(slot_index(&state, "SMALL 3"));
         assert_eq!(state.assign_assets().to_vec(), vec!["pup"]);
         // An unknown slot is refused.
         state.select_target(999);
-        assert_eq!(state.assign_target, slot_index(&state, "SMALL 1"));
+        assert_eq!(state.assign_target, slot_index(&state, "SMALL 3"));
     }
 
     /// The assign panel offers a slot only the art of **its own size**.
@@ -7996,7 +8941,7 @@ mod tests {
         state.select_target(slot_index(&state, "BIG 1"));
         assert_eq!(state.assign_assets().to_vec(), vec!["cat"]);
         // SMALL 1: the small sprites only.
-        state.select_target(slot_index(&state, "SMALL 1"));
+        state.select_target(slot_index(&state, "SMALL 3"));
         assert_eq!(state.assign_assets().to_vec(), vec!["pup", "kit"]);
     }
 
@@ -8013,7 +8958,7 @@ mod tests {
             vec![],
             no_assignments(),
         );
-        state.select_target(slot_index(&state, "SMALL 3"));
+        state.select_target(slot_index(&state, "SMALL 5"));
         state.select_asset(0);
         state.assign_action_with(Instant::now(), |write| {
             let crate::editor::AssignWrite::Assignments(table) = write else {
@@ -8031,7 +8976,7 @@ mod tests {
         assert_eq!(back.assignments.small(2), None, "the other slots stay");
         // The toast names the slot and the asset.
         let toast = state.active_toast().expect("a toast");
-        assert_eq!(toast, "ASSIGNED SMALL 3 = CAT");
+        assert_eq!(toast, "ASSIGNED SMALL 5 = CAT");
         // The state keeps the new table.
         assert_eq!(state.assignments.small(3), Some("cat"));
         let _ = std::fs::remove_dir_all(&root);
@@ -8049,7 +8994,7 @@ mod tests {
         table.set(slot, Some("cat".to_string()));
         let mut state = state();
         state.enter_assign_mode_with(vec![asset("cat", DrawnSize::Small)], vec![], table);
-        state.select_target(slot_index(&state, "SMALL 3"));
+        state.select_target(slot_index(&state, "SMALL 5"));
         state.clear_action_with(Instant::now(), |write| {
             let crate::editor::AssignWrite::Assignments(table) = write else {
                 return Err("not an assignment write".to_string());
@@ -8064,7 +9009,7 @@ mod tests {
         assert_eq!(back.assignments.small(3), None, "the assignment is gone");
         assert_eq!(state.assignments.small(3), None);
         let toast = state.active_toast().expect("a toast");
-        assert_eq!(toast, "CLEARED SMALL 3");
+        assert_eq!(toast, "CLEARED SMALL 5");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8223,8 +9168,8 @@ mod tests {
                 "DRAW must stop before SAVE (width {width})"
             );
             assert!(
-                layout.name_field.x >= layout.dropdowns[2].right(),
-                "the name field must start after the dropdowns (width {width})"
+                layout.name_field.x >= layout.dropdowns[3].right(),
+                "the name field must start after all four dropdowns (width {width})"
             );
         }
     }
@@ -8485,7 +9430,7 @@ mod tests {
             vec![],
             no_assignments(),
         );
-        state.select_target(slot_index(&state, "SMALL 3"));
+        state.select_target(slot_index(&state, "SMALL 5"));
         let mut saved = false;
         let mut wrote = false;
         // Nothing is picked yet: Enter says so, and saves nothing.
@@ -8529,7 +9474,7 @@ mod tests {
         assert!(wrote, "the assignment is written");
         assert!(!saved, "the drawing is never saved");
         let toast = state.active_toast().expect("a toast");
-        assert_eq!(toast, "ASSIGNED SMALL 3 = CAT");
+        assert_eq!(toast, "ASSIGNED SMALL 5 = CAT");
     }
 
     // -----------------------------------------------------------------
@@ -8855,7 +9800,7 @@ mod tests {
         // tile has its own target row now (decision F-162), and its
         // list starts empty on this seam.
         assert_eq!(state.targets.len(), ASSIGN_TARGET_COUNT);
-        state.select_target(slot_index(&state, "SMALL 1"));
+        state.select_target(slot_index(&state, "SMALL 3"));
         assert_eq!(state.assign_assets().to_vec(), vec!["cat"]);
         state.select_target(slot_index(&state, "BALLOON 1"));
         assert_eq!(state.assign_assets().to_vec(), vec!["party"]);
@@ -9460,13 +10405,12 @@ mod tests {
             if grid.char_at(col + 10, row + offset).unwrap_or(' ') == ' ' {
                 continue;
             }
-            assert_eq!(
-                grid.color_at(col + 10, row + offset),
-                Some(dim_color(crate::scene::DUCK_COLOR)),
-                "the underlay is the dimmed built-in art"
-            );
-            found = true;
-            break;
+            // The canvas' chrome (outline, dots) shares the column; the
+            // underlay is the cell that carries the **dimmed duck**.
+            if grid.color_at(col + 10, row + offset) == Some(dim_color(crate::scene::DUCK_COLOR)) {
+                found = true;
+                break;
+            }
         }
         assert!(found, "the built-in duck is shown under the decoration");
     }
@@ -9507,7 +10451,7 @@ mod tests {
         // its own target rows now (decision F-162), and their lists
         // start empty on this seam.
         assert_eq!(state.targets.len(), ASSIGN_TARGET_COUNT);
-        state.select_target(slot_index(&state, "SMALL 1"));
+        state.select_target(slot_index(&state, "SMALL 3"));
         assert_eq!(state.assign_assets().to_vec(), vec!["cat"]);
         state.select_target(slot_index(&state, "DECO BIG"));
         assert!(state.assign_assets().is_empty());

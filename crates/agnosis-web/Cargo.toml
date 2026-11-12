@@ -22,6 +22,12 @@ agnosis-core = { path = "../agnosis-core" }
 # fullscreen-quad shader; `std` is what the browser build needs.
 wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "std", "webgpu", "webgl"] }
 
+# The editor's clock type on the browser target (roadmap WASM §6): the
+# std `Instant::now` panics on wasm32-unknown-unknown, and web-time's is
+# backed by the browser's `performance.now()`. On host targets it is the
+# std re-export, so the editor's model tests run unchanged.
+web-time = "1.1.0"
+
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "=0.4.79"
 js-sys = { version = "=0.3.106", default-features = false, features = ["std"] }

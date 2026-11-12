@@ -57,18 +57,19 @@ pub fn delay_cs(fps: u32) -> u16 {
     ((100 / fps.max(1)) as u16).max(1)
 }
 
-/// Run `f` with the live app's config and a **copy** of its store.
+/// Run `f` with the live app's config and its **store**, borrowed.
 ///
-/// WHY a copy: the recorder answers the loader for every assigned
-/// asset while it builds its own scene, and a borrow of the live
-/// state would hold the parade's `RefCell` across that whole walk —
-/// a copy keeps the live app free the moment this call returns.
+/// The store is the shared handle the editor saves into too
+/// (roadmap WASM §6); the borrow here lives only for this call — the
+/// recorder inside `f` answers its loader from the same `&AssetStore`
+/// reference, so the store is never copied for a recording.
 fn with_live<T>(f: impl FnOnce(&Config, &AssetStore) -> Result<T, String>) -> Result<T, String> {
     let Some(app) = the_app() else {
         return Err("the parade is not running yet".to_string());
     };
     let state = app.borrow();
-    f(&state.sim.cfg, &state.sim.assets)
+    let store = state.sim.assets.borrow();
+    f(&state.sim.cfg, &store)
 }
 
 /// The loader over one copy of the store.
